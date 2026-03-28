@@ -377,7 +377,7 @@ Usage:
   npx @thirdchimp/skills-manager <command> [args]
 
 Commands:
-  search <query>                    Search skills (local registry → skills.sh)
+  search <query> [limit]            Search skills (local registry → skills.sh), default 10
   install <owner/repo> <name>       Install a skill with security scanning
   evaluate <response-file> <id>     Parse Skills Report from subagent response
   cleanup                           Remove unused skills
@@ -409,9 +409,10 @@ async function main() {
     case "search": {
       const query = args[0];
       if (!query) {
-        console.error("Error: query required\nUsage: skills-manager search <query>");
+        console.error("Error: query required\nUsage: skills-manager search <query> [limit]");
         process.exit(1);
       }
+      const limit = parseInt(args[1] ?? "10", 10) || 10;
       const result = await search(query);
       if (result.fromRegistry.length > 0) {
         console.log("From registry:");
@@ -422,15 +423,13 @@ async function main() {
       }
       if (result.fromWeb.length > 0) {
         console.log("From skills.sh:");
-        for (const s of result.fromWeb.slice(0, 5)) {
+        for (const s of result.fromWeb.slice(0, limit)) {
           console.log(`  📦 ${s.skill} (${s.repo}) — ${s.installs} installs`);
         }
       }
       if (result.fromRegistry.length === 0 && result.fromWeb.length === 0) {
         console.log("No results found.");
       }
-      console.log("\n---JSON---");
-      console.log(JSON.stringify(result));
       break;
     }
 
