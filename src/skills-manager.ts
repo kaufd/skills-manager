@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env node
 /**
  * Skills Manager — search, install, evaluate and cleanup skills from skills.sh.
  * Used by AI orchestrators for dynamic skill management per task.

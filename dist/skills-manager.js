@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// @bun
 
 // src/skills-manager.ts
 import { readFile, writeFile } from "fs/promises";
@@ -14,8 +13,7 @@ var DEFAULT_REGISTRY = {
 var REGISTRY_PATH_DEFAULT = join(process.cwd(), ".claude", "skills-registry.json");
 var SKILLS_DIR = join(process.cwd(), ".claude", "skills");
 async function loadRegistry(path = REGISTRY_PATH_DEFAULT) {
-  if (!existsSync(path))
-    return { ...DEFAULT_REGISTRY, skills: {} };
+  if (!existsSync(path)) return { ...DEFAULT_REGISTRY, skills: {} };
   const raw = await readFile(path, "utf-8");
   return JSON.parse(raw);
 }
@@ -24,7 +22,9 @@ async function saveRegistry(path = REGISTRY_PATH_DEFAULT, registry) {
 }
 function searchRegistry(registry, query) {
   const q = query.toLowerCase();
-  const matches = Object.values(registry.skills).filter((s) => s.skill.toLowerCase().includes(q) || s.repo.toLowerCase().includes(q));
+  const matches = Object.values(registry.skills).filter(
+    (s) => s.skill.toLowerCase().includes(q) || s.repo.toLowerCase().includes(q)
+  );
   return matches.sort((a, b) => {
     const score = (s) => s.useful === true ? 2 : s.useful === null ? 1 : 0;
     return score(b) - score(a);
@@ -34,10 +34,9 @@ async function searchSkillsSh(query) {
   try {
     const url = `https://skills.sh/search?q=${encodeURIComponent(query)}`;
     const resp = await fetch(url);
-    if (!resp.ok)
-      return [];
+    if (!resp.ok) return [];
     const text = await resp.text();
-    const regex = /(\S+)\s+\((\S+\/\S+)\)\s*[-\u2014]\s*(\d+)\s*install/gi;
+    const regex = /(\S+)\s+\((\S+\/\S+)\)\s*[-—]\s*(\d+)\s*install/gi;
     const candidates = [];
     let match;
     while ((match = regex.exec(text)) !== null) {
@@ -100,8 +99,7 @@ function scanSkillContent(content) {
 var SKILLS_CLI_VERSION = "1.4.6";
 function buildInstallCommand(repo, opts = {}) {
   const parts = [`npx skills@${SKILLS_CLI_VERSION} add ${repo}`];
-  if (opts.copy)
-    parts.push("--copy");
+  if (opts.copy) parts.push("--copy");
   parts.push("-y");
   return parts.join(" ");
 }
@@ -136,7 +134,7 @@ async function install(repo, skillName, registryPath = REGISTRY_PATH_DEFAULT) {
   }
   const cmd = buildInstallCommand(repo, { copy: true });
   try {
-    execSync(cmd, { stdio: "pipe", timeout: 30000 });
+    execSync(cmd, { stdio: "pipe", timeout: 3e4 });
   } catch (err) {
     return {
       installed: false,
@@ -156,9 +154,10 @@ async function install(repo, skillName, registryPath = REGISTRY_PATH_DEFAULT) {
     try {
       execSync(`npx skills@${SKILLS_CLI_VERSION} remove -s ${skillName} -y`, {
         stdio: "pipe",
-        timeout: 15000
+        timeout: 15e3
       });
-    } catch {}
+    } catch {
+    }
     return {
       installed: false,
       skillName,
@@ -172,22 +171,22 @@ async function install(repo, skillName, registryPath = REGISTRY_PATH_DEFAULT) {
     usedIn: [],
     useful: null,
     lastUsed: null,
-    installedAt: new Date().toISOString().split("T")[0],
+    installedAt: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
     trusted: isTrustedOwner(repo)
   };
   await saveRegistry(registryPath, registry);
   return { installed: true, skillName, reason: "ok" };
 }
 function parseSkillsReport(subagentResponse) {
-  const reportMatch = subagentResponse.match(/###\s*Skills\s*Report\s*\n([\s\S]*?)(?:\n###|\n---|$)/i);
-  if (!reportMatch)
-    return { used: [], ignored: [] };
+  const reportMatch = subagentResponse.match(
+    /###\s*Skills\s*Report\s*\n([\s\S]*?)(?:\n###|\n---|$)/i
+  );
+  if (!reportMatch) return { used: [], ignored: [] };
   const block = reportMatch[1];
   const usedMatch = block.match(/[-*]\s*used:\s*(.+)/i);
   const ignoredMatch = block.match(/[-*]\s*ignored:\s*(.+)/i);
   const parseList = (raw) => {
-    if (!raw)
-      return [];
+    if (!raw) return [];
     return raw.split(/[,(]/).map((s) => s.replace(/\).*/, "").trim()).filter((s) => s.length > 0 && !s.includes(" "));
   };
   return {
@@ -196,7 +195,7 @@ function parseSkillsReport(subagentResponse) {
   };
 }
 function evaluateSkills(registry, report) {
-  const today = new Date().toISOString().split("T")[0];
+  const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
   for (const name of report.used) {
     if (registry.skills[name]) {
       registry.skills[name].useful = true;
@@ -215,8 +214,7 @@ function evaluateSkills(registry, report) {
 }
 function getSkillsToRemove(registry, projectSkills) {
   return Object.values(registry.skills).filter((s) => {
-    if (projectSkills.includes(s.skill))
-      return false;
+    if (projectSkills.includes(s.skill)) return false;
     return s.useful !== true;
   }).map((s) => s.skill);
 }
@@ -229,7 +227,7 @@ async function cleanup(registryPath = REGISTRY_PATH_DEFAULT) {
     try {
       execSync(`npx skills@${SKILLS_CLI_VERSION} remove -s ${name} -y`, {
         stdio: "pipe",
-        timeout: 15000
+        timeout: 15e3
       });
       removed.push(name);
     } catch {
@@ -286,8 +284,7 @@ async function main() {
     case "search": {
       const query = args[0];
       if (!query) {
-        console.error(`Error: query required
-Usage: skills-manager search <query>`);
+        console.error("Error: query required\nUsage: skills-manager search <query>");
         process.exit(1);
       }
       const result = await search(query);
@@ -301,14 +298,13 @@ Usage: skills-manager search <query>`);
       if (result.fromWeb.length > 0) {
         console.log("From skills.sh:");
         for (const s of result.fromWeb.slice(0, 5)) {
-          console.log(`  \uD83D\uDCE6 ${s.skill} (${s.repo}) \u2014 ${s.installs} installs`);
+          console.log(`  \u{1F4E6} ${s.skill} (${s.repo}) \u2014 ${s.installs} installs`);
         }
       }
       if (result.fromRegistry.length === 0 && result.fromWeb.length === 0) {
         console.log("No results found.");
       }
-      console.log(`
----JSON---`);
+      console.log("\n---JSON---");
       console.log(JSON.stringify(result));
       break;
     }
@@ -316,8 +312,9 @@ Usage: skills-manager search <query>`);
       const repo = args[0];
       const skillName = args[1];
       if (!repo || !skillName) {
-        console.error(`Error: repo and name required
-Usage: skills-manager install <owner/repo> <skill-name>`);
+        console.error(
+          "Error: repo and name required\nUsage: skills-manager install <owner/repo> <skill-name>"
+        );
         process.exit(1);
       }
       const result = await install(repo, skillName);
@@ -328,8 +325,9 @@ Usage: skills-manager install <owner/repo> <skill-name>`);
       const responseFile = args[0];
       const orchId = args[1];
       if (!responseFile || !orchId) {
-        console.error(`Error: file and id required
-Usage: skills-manager evaluate <response-file> <orch-id>`);
+        console.error(
+          "Error: file and id required\nUsage: skills-manager evaluate <response-file> <orch-id>"
+        );
         process.exit(1);
       }
       const response = await readFile(responseFile, "utf-8");
@@ -356,7 +354,9 @@ Usage: skills-manager evaluate <response-file> <orch-id>`);
       }
       for (const entry of entries) {
         const status = entry.useful === true ? "\u2705" : entry.useful === false ? "\u274C" : "\u2753";
-        console.log(`${status} ${entry.skill} (${entry.repo}) \u2014 last used: ${entry.lastUsed ?? "never"}`);
+        console.log(
+          `${status} ${entry.skill} (${entry.repo}) \u2014 last used: ${entry.lastUsed ?? "never"}`
+        );
       }
       break;
     }
@@ -378,26 +378,26 @@ if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith
   });
 }
 export {
-  shouldSkipInstall,
-  searchSkillsSh,
-  searchRegistry,
-  search,
-  scanSkillContent,
-  saveRegistry,
-  parseSkillsReport,
-  parseArgs,
-  loadRegistry,
-  isTrustedOwner,
-  install,
-  getSkillsToRemove,
-  getProjectSkillNames,
-  evaluateSkills,
-  evaluateInstallSafety,
-  cleanup,
-  buildInstallCommand,
-  TRUSTED_OWNERS,
-  SKILLS_DIR,
-  SKILLS_CLI_VERSION,
+  DEFAULT_REGISTRY,
   REGISTRY_PATH_DEFAULT,
-  DEFAULT_REGISTRY
+  SKILLS_CLI_VERSION,
+  SKILLS_DIR,
+  TRUSTED_OWNERS,
+  buildInstallCommand,
+  cleanup,
+  evaluateInstallSafety,
+  evaluateSkills,
+  getProjectSkillNames,
+  getSkillsToRemove,
+  install,
+  isTrustedOwner,
+  loadRegistry,
+  parseArgs,
+  parseSkillsReport,
+  saveRegistry,
+  scanSkillContent,
+  search,
+  searchRegistry,
+  searchSkillsSh,
+  shouldSkipInstall
 };
