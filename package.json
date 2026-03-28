@@ -1,0 +1,42 @@
+{
+  "name": "@thirdchimp/skills-manager",
+  "version": "1.0.0",
+  "description": "Dynamic skill discovery, install, evaluate and cleanup from skills.sh for AI agent orchestrators",
+  "keywords": [
+    "skills",
+    "skills.sh",
+    "claude",
+    "ai",
+    "orchestration",
+    "agents"
+  ],
+  "author": "kaufd",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kaufd/skills-manager.git"
+  },
+  "homepage": "https://github.com/kaufd/skills-manager#readme",
+  "type": "module",
+  "main": "./dist/skills-manager.js",
+  "bin": {
+    "skills-manager": "./dist/skills-manager.js"
+  },
+  "files": [
+    "dist/",
+    "SKILL.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bun build src/skills-manager.ts --outfile dist/skills-manager.js --target node && tail -n +2 dist/skills-manager.js > /tmp/sm_shebang && printf '#!/usr/bin/env node\\n' | cat - /tmp/sm_shebang > dist/skills-manager.js && chmod +x dist/skills-manager.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
