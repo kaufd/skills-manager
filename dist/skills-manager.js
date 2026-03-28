@@ -295,6 +295,8 @@ async function main() {
       if (result.fromRegistry.length === 0 && result.fromWeb.length === 0) {
         console.log("No results found.");
       }
+      console.log("\n---JSON---");
+      console.log(JSON.stringify(result));
       break;
     }
     case "install": {
