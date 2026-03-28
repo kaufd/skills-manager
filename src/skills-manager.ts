@@ -79,22 +79,13 @@ export function searchRegistry(registry: SkillsRegistry, query: string): SkillEn
 
 export async function searchSkillsSh(query: string): Promise<SkillCandidate[]> {
   try {
-    const url = `https://skills.sh/search?q=${encodeURIComponent(query)}`;
+    const url = `https://skills.sh/api/search?q=${encodeURIComponent(query)}`;
     const resp = await fetch(url);
     if (!resp.ok) return [];
-    const text = await resp.text();
-
-    const regex = /(\S+)\s+\((\S+\/\S+)\)\s*[-—]\s*(\d+)\s*install/gi;
-    const candidates: SkillCandidate[] = [];
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(text)) !== null) {
-      candidates.push({
-        skill: match[1],
-        repo: match[2],
-        installs: parseInt(match[3], 10),
-      });
-    }
-    return candidates.sort((a, b) => b.installs - a.installs);
+    const data = await resp.json() as { skills: { name: string; source: string; installs: number }[] };
+    return (data.skills ?? [])
+      .map((s) => ({ skill: s.name, repo: s.source, installs: s.installs }))
+      .sort((a, b) => b.installs - a.installs);
   } catch {
     return [];
   }
