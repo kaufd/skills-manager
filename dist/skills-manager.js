@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/skills-manager.ts
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "fs/promises";
 import { existsSync, readdirSync } from "fs";
 import { execFileSync } from "child_process";
 import { basename, join } from "path";
@@ -19,7 +19,9 @@ async function loadRegistry(path = REGISTRY_PATH_DEFAULT) {
   return JSON.parse(raw);
 }
 async function saveRegistry(path = REGISTRY_PATH_DEFAULT, registry) {
-  await writeFile(path, JSON.stringify(registry, null, 2), "utf-8");
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify(registry, null, 2), "utf-8");
+  await rename(tmp, path);
 }
 function searchRegistry(registry, query) {
   const q = query.toLowerCase();
@@ -165,9 +167,6 @@ function buildInstallArgs(repo, skillName) {
     "-y"
   ];
 }
-function buildRemoveArgs(skillName) {
-  return [`skills@${SKILLS_CLI_VERSION}`, "remove", "-s", skillName, "-y"];
-}
 function getLocalSkillNames(skillsDir = SKILLS_DIR) {
   try {
     return readdirSync(skillsDir).filter((name) => !name.startsWith("."));
@@ -176,7 +175,8 @@ function getLocalSkillNames(skillsDir = SKILLS_DIR) {
   }
 }
 function shouldSkipInstall(skillName, localSkills) {
-  return localSkills.includes(skillName);
+  const name = skillName.toLowerCase();
+  return localSkills.some((s) => s.toLowerCase() === name);
 }
 async function install(repo, skillName, registryPath = REGISTRY_PATH_DEFAULT, opts = {}) {
   if (!validateRepo(repo)) {
@@ -186,67 +186,60 @@ async function install(repo, skillName, registryPath = REGISTRY_PATH_DEFAULT, op
     return { installed: false, skillName, reason: "invalid skill name", flags: [] };
   }
   if (shouldSkipInstall(skillName, getLocalSkillNames())) {
-    return {
-      installed: false,
-      skillName,
-      reason: `conflict: local skill "${skillName}" already exists`,
-      flags: []
-    };
+    return { installed: false, skillName, reason: `conflict: local skill "${skillName}" already exists`, flags: [] };
   }
-  let forceFlags = [];
-  if (!isTrustedOwner(repo)) {
-    let flags;
+  const sandbox = await mkdtemp(join(tmpdir(), "skills-manager-"));
+  try {
     try {
-      flags = await scanInSandbox(repo, skillName);
+      npx(buildInstallArgs(repo, skillName), { cwd: sandbox, timeout: 6e4 });
     } catch (err) {
       return { installed: false, skillName, reason: `sandbox install failed: ${String(err)}`, flags: [] };
     }
-    if (flags.length > 0 && !opts.force) {
-      return { installed: false, skillName, reason: `quarantine: ${flags.join(", ")}`, flags };
+    const sandboxSkills = join(sandbox, ".claude", "skills");
+    const dirs = getLocalSkillNames(sandboxSkills);
+    if (dirs.length !== 1) {
+      return { installed: false, skillName, reason: `expected exactly one skill in download, got ${dirs.length}`, flags: [] };
     }
-    forceFlags = flags;
-  }
-  try {
-    npx(buildInstallArgs(repo, skillName), { cwd: process.cwd(), timeout: 6e4 });
-  } catch (err) {
-    return { installed: false, skillName, reason: `install failed: ${String(err)}`, flags: [] };
-  }
-  try {
-    await readFile(join(SKILLS_DIR, skillName, "SKILL.md"), "utf-8");
-  } catch {
-    let rolledBack = false;
+    const dirName = dirs[0];
+    const source = join(sandboxSkills, dirName);
+    if (!validateSkillName(dirName)) {
+      return { installed: false, skillName, reason: `invalid installed directory name "${dirName}"`, flags: [] };
+    }
+    if (!existsSync(join(source, "SKILL.md"))) {
+      return { installed: false, skillName: dirName, reason: "SKILL.md not found in download", flags: [] };
+    }
+    if (shouldSkipInstall(dirName, getLocalSkillNames())) {
+      return { installed: false, skillName: dirName, reason: `conflict: local skill "${dirName}" already exists`, flags: [] };
+    }
+    let flags = [];
+    if (!isTrustedOwner(repo)) {
+      flags = (await scanSkillDir(source)).flags;
+      if (flags.length > 0 && !opts.force) {
+        return { installed: false, skillName: dirName, reason: `quarantine: ${flags.join(", ")}`, flags };
+      }
+    }
+    await mkdir(SKILLS_DIR, { recursive: true });
+    const staging = join(SKILLS_DIR, `.${dirName}.${process.pid}.tmp`);
     try {
-      npx(buildRemoveArgs(skillName), { cwd: process.cwd(), timeout: 15e3 });
-      rolledBack = true;
-    } catch {
+      await cp(source, staging, { recursive: true, errorOnExist: true, force: false });
+      await rename(staging, join(SKILLS_DIR, dirName));
+    } catch (err) {
+      await rm(staging, { recursive: true, force: true });
+      return { installed: false, skillName: dirName, reason: `copy failed: ${String(err)}`, flags };
     }
-    return {
-      installed: false,
-      skillName,
-      reason: rolledBack ? "installed but SKILL.md not found; rolled back" : `installed but SKILL.md not found; rollback failed, remove .claude/skills/${skillName} manually`,
-      flags: []
+    const registry = await loadRegistry(registryPath);
+    registry.skills[dirName] = {
+      repo,
+      skill: dirName,
+      usedIn: [],
+      useful: null,
+      lastUsed: null,
+      installedAt: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
+      trusted: isTrustedOwner(repo)
     };
-  }
-  const registry = await loadRegistry(registryPath);
-  registry.skills[skillName] = {
-    repo,
-    skill: skillName,
-    usedIn: [],
-    useful: null,
-    lastUsed: null,
-    installedAt: (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
-    trusted: isTrustedOwner(repo)
-  };
-  await saveRegistry(registryPath, registry);
-  const reason = forceFlags.length > 0 ? `force-installed despite flags: ${forceFlags.join(", ")}` : "ok";
-  return { installed: true, skillName, reason, flags: forceFlags };
-}
-async function scanInSandbox(repo, skillName) {
-  const sandbox = await mkdtemp(join(tmpdir(), "skills-manager-"));
-  try {
-    npx(buildInstallArgs(repo, skillName), { cwd: sandbox, timeout: 6e4 });
-    const scan = await scanSkillDir(join(sandbox, ".claude", "skills", skillName));
-    return scan.flags;
+    await saveRegistry(registryPath, registry);
+    const reason = flags.length > 0 ? `force-installed despite flags: ${flags.join(", ")}` : "ok";
+    return { installed: true, skillName: dirName, reason, flags };
   } finally {
     await rm(sandbox, { recursive: true, force: true });
   }
@@ -280,8 +273,9 @@ function evaluateSkills(registry, report) {
     }
   }
   for (const name of report.ignored) {
-    if (registry.skills[name]) {
-      registry.skills[name].useful = false;
+    const entry = registry.skills[name];
+    if (entry && entry.usedIn.length === 0) {
+      entry.useful = false;
     }
   }
   return registry;
@@ -304,7 +298,7 @@ async function cleanup(registryPath = REGISTRY_PATH_DEFAULT) {
       continue;
     }
     try {
-      npx(buildRemoveArgs(name), { cwd: process.cwd(), timeout: 3e4 });
+      await rm(join(SKILLS_DIR, name), { recursive: true, force: true });
       removed.push(name);
       delete registry.skills[name];
     } catch {
@@ -350,8 +344,9 @@ Registry:
 
 Security:
   Trusted owners (anthropics, vercel-labs, github, ...) skip scanning.
-  Untrusted skills are installed into a sandbox dir first and every file
-  is scanned (SKILL.md, scripts/, load-time hooks). Flagged skills are
+  Every skill is downloaded once into a sandbox dir; untrusted ones have
+  every file scanned there (SKILL.md, scripts/, load-time hooks). The
+  scanned copy itself is moved into .claude/skills. Flagged skills are
   quarantined: NOT installed, flags are returned. Pass --force after
   human review to install anyway.
 `);
@@ -466,7 +461,6 @@ export {
   SKILLS_DIR,
   TRUSTED_OWNERS,
   buildInstallArgs,
-  buildRemoveArgs,
   cleanup,
   evaluateSkills,
   getLocalSkillNames,

@@ -7,7 +7,7 @@
  *        npx @thirdchimp/skills-manager <command> [args]
  */
 
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { basename, join } from "node:path";
@@ -55,7 +55,11 @@ export async function saveRegistry(
   path: string = REGISTRY_PATH_DEFAULT,
   registry: SkillsRegistry,
 ): Promise<void> {
-  await writeFile(path, JSON.stringify(registry, null, 2), "utf-8");
+  // Write-then-rename so an interrupted write never leaves a truncated registry.
+  // simplicity: concurrent sessions can still lose each other's updates (last write wins); add a lock if that bites
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify(registry, null, 2), "utf-8");
+  await rename(tmp, path);
 }
 
 // --- Search ---
@@ -234,7 +238,7 @@ export function npx(args: string[], opts: { cwd: string; timeout?: number }): vo
   execFileSync(npxFile(), args, { stdio: "pipe", cwd: opts.cwd, timeout: opts.timeout ?? 30_000 });
 }
 
-/** Args for installing exactly one skill as a copy via the claude-code agent (target dir is the CLI's cwd). */
+/** Args for downloading exactly one skill as a copy via the claude-code agent (target dir is the CLI's cwd). */
 export function buildInstallArgs(repo: string, skillName: string): string[] {
   return [
     `skills@${SKILLS_CLI_VERSION}`,
@@ -249,10 +253,6 @@ export function buildInstallArgs(repo: string, skillName: string): string[] {
   ];
 }
 
-export function buildRemoveArgs(skillName: string): string[] {
-  return [`skills@${SKILLS_CLI_VERSION}`, "remove", "-s", skillName, "-y"];
-}
-
 /** Names of skills physically present in the local skills dir (project-owned or installed). */
 export function getLocalSkillNames(skillsDir: string = SKILLS_DIR): string[] {
   try {
@@ -262,8 +262,10 @@ export function getLocalSkillNames(skillsDir: string = SKILLS_DIR): string[] {
   }
 }
 
+// Case-insensitive: on macOS/Windows "Vitest" and "vitest" are the same directory.
 export function shouldSkipInstall(skillName: string, localSkills: string[]): boolean {
-  return localSkills.includes(skillName);
+  const name = skillName.toLowerCase();
+  return localSkills.some((s) => s.toLowerCase() === name);
 }
 
 export interface InstallResult {
@@ -274,9 +276,10 @@ export interface InstallResult {
 }
 
 /**
- * Installs exactly one skill. Untrusted repos are installed into a throwaway
- * sandbox dir first and every file is scanned; flagged skills are quarantined
- * (not installed) unless opts.force is set after human review.
+ * Installs exactly one skill. Every repo is downloaded once into a throwaway
+ * sandbox dir; untrusted ones are scanned there (flagged skills are quarantined
+ * unless opts.force is set after human review). The very copy that was scanned
+ * is then moved into .claude/skills — nothing is downloaded a second time.
  */
 export async function install(
   repo: string,
@@ -290,81 +293,72 @@ export async function install(
   if (!validateSkillName(skillName)) {
     return { installed: false, skillName, reason: "invalid skill name", flags: [] };
   }
-
+  // Cheap early exit; the authoritative check below uses the real directory name.
   if (shouldSkipInstall(skillName, getLocalSkillNames())) {
-    return {
-      installed: false,
-      skillName,
-      reason: `conflict: local skill "${skillName}" already exists`,
-      flags: [],
-    };
+    return { installed: false, skillName, reason: `conflict: local skill "${skillName}" already exists`, flags: [] };
   }
 
-  let forceFlags: string[] = [];
-  if (!isTrustedOwner(repo)) {
-    let flags: string[];
+  const sandbox = await mkdtemp(join(tmpdir(), "skills-manager-"));
+  try {
     try {
-      flags = await scanInSandbox(repo, skillName);
+      npx(buildInstallArgs(repo, skillName), { cwd: sandbox, timeout: 60_000 });
     } catch (err) {
       return { installed: false, skillName, reason: `sandbox install failed: ${String(err)}`, flags: [] };
     }
-    if (flags.length > 0 && !opts.force) {
-      return { installed: false, skillName, reason: `quarantine: ${flags.join(", ")}`, flags };
+
+    // The CLI names the directory after the skill's frontmatter name (lowercased,
+    // sanitized), not after --skill, so read the real name from disk.
+    const sandboxSkills = join(sandbox, ".claude", "skills");
+    const dirs = getLocalSkillNames(sandboxSkills);
+    if (dirs.length !== 1) {
+      return { installed: false, skillName, reason: `expected exactly one skill in download, got ${dirs.length}`, flags: [] };
     }
-    forceFlags = flags;
-  }
+    const dirName = dirs[0];
+    const source = join(sandboxSkills, dirName);
+    if (!validateSkillName(dirName)) {
+      return { installed: false, skillName, reason: `invalid installed directory name "${dirName}"`, flags: [] };
+    }
+    if (!existsSync(join(source, "SKILL.md"))) {
+      return { installed: false, skillName: dirName, reason: "SKILL.md not found in download", flags: [] };
+    }
+    if (shouldSkipInstall(dirName, getLocalSkillNames())) {
+      return { installed: false, skillName: dirName, reason: `conflict: local skill "${dirName}" already exists`, flags: [] };
+    }
 
-  try {
-    npx(buildInstallArgs(repo, skillName), { cwd: process.cwd(), timeout: 60_000 });
-  } catch (err) {
-    return { installed: false, skillName, reason: `install failed: ${String(err)}`, flags: [] };
-  }
+    let flags: string[] = [];
+    if (!isTrustedOwner(repo)) {
+      flags = (await scanSkillDir(source)).flags;
+      if (flags.length > 0 && !opts.force) {
+        return { installed: false, skillName: dirName, reason: `quarantine: ${flags.join(", ")}`, flags };
+      }
+    }
 
-  // Fail closed: an install we cannot verify gets rolled back.
-  try {
-    await readFile(join(SKILLS_DIR, skillName, "SKILL.md"), "utf-8");
-  } catch {
-    let rolledBack = false;
+    // Copy next to the target, then rename: the target never exists half-written,
+    // and rename refuses to replace a non-empty directory that appeared meanwhile.
+    await mkdir(SKILLS_DIR, { recursive: true });
+    const staging = join(SKILLS_DIR, `.${dirName}.${process.pid}.tmp`);
     try {
-      npx(buildRemoveArgs(skillName), { cwd: process.cwd(), timeout: 15_000 });
-      rolledBack = true;
-    } catch {
-      /* best effort rollback */
+      await cp(source, staging, { recursive: true, errorOnExist: true, force: false });
+      await rename(staging, join(SKILLS_DIR, dirName));
+    } catch (err) {
+      await rm(staging, { recursive: true, force: true });
+      return { installed: false, skillName: dirName, reason: `copy failed: ${String(err)}`, flags };
     }
-    return {
-      installed: false,
-      skillName,
-      reason: rolledBack
-        ? "installed but SKILL.md not found; rolled back"
-        : `installed but SKILL.md not found; rollback failed, remove .claude/skills/${skillName} manually`,
-      flags: [],
+
+    const registry = await loadRegistry(registryPath);
+    registry.skills[dirName] = {
+      repo,
+      skill: dirName,
+      usedIn: [],
+      useful: null,
+      lastUsed: null,
+      installedAt: new Date().toISOString().split("T")[0],
+      trusted: isTrustedOwner(repo),
     };
-  }
+    await saveRegistry(registryPath, registry);
 
-  const registry = await loadRegistry(registryPath);
-  registry.skills[skillName] = {
-    repo,
-    skill: skillName,
-    usedIn: [],
-    useful: null,
-    lastUsed: null,
-    installedAt: new Date().toISOString().split("T")[0],
-    trusted: isTrustedOwner(repo),
-  };
-  await saveRegistry(registryPath, registry);
-
-  const reason =
-    forceFlags.length > 0 ? `force-installed despite flags: ${forceFlags.join(", ")}` : "ok";
-  return { installed: true, skillName, reason, flags: forceFlags };
-}
-
-/** Installs the skill into a sandbox dir and returns scanner flags; throws on CLI failure. */
-async function scanInSandbox(repo: string, skillName: string): Promise<string[]> {
-  const sandbox = await mkdtemp(join(tmpdir(), "skills-manager-"));
-  try {
-    npx(buildInstallArgs(repo, skillName), { cwd: sandbox, timeout: 60_000 });
-    const scan = await scanSkillDir(join(sandbox, ".claude", "skills", skillName));
-    return scan.flags;
+    const reason = flags.length > 0 ? `force-installed despite flags: ${flags.join(", ")}` : "ok";
+    return { installed: true, skillName: dirName, reason, flags };
   } finally {
     await rm(sandbox, { recursive: true, force: true });
   }
@@ -419,9 +413,11 @@ export function evaluateSkills(
     }
   }
 
+  // "Not needed for this task" must not outvote earlier runs where the skill was used.
   for (const name of report.ignored) {
-    if (registry.skills[name]) {
-      registry.skills[name].useful = false;
+    const entry = registry.skills[name];
+    if (entry && entry.usedIn.length === 0) {
+      entry.useful = false;
     }
   }
 
@@ -455,13 +451,14 @@ export async function cleanup(
   for (const name of toRemove) {
     if (!validateSkillName(name)) {
       // install() only writes valid names; a hand-edited registry must never
-      // reach a subprocess. Surface it and drop the unusable entry.
+      // reach the filesystem as a path. Surface it and drop the unusable entry.
       failed.push(name);
       delete registry.skills[name];
       continue;
     }
     try {
-      npx(buildRemoveArgs(name), { cwd: process.cwd(), timeout: 30_000 });
+      // Only the copy install() made; other agents' skill dirs are never touched.
+      await rm(join(SKILLS_DIR, name), { recursive: true, force: true });
       removed.push(name);
       delete registry.skills[name]; // entry is dropped only after a successful removal
     } catch {
@@ -513,8 +510,9 @@ Registry:
 
 Security:
   Trusted owners (anthropics, vercel-labs, github, ...) skip scanning.
-  Untrusted skills are installed into a sandbox dir first and every file
-  is scanned (SKILL.md, scripts/, load-time hooks). Flagged skills are
+  Every skill is downloaded once into a sandbox dir; untrusted ones have
+  every file scanned there (SKILL.md, scripts/, load-time hooks). The
+  scanned copy itself is moved into .claude/skills. Flagged skills are
   quarantined: NOT installed, flags are returned. Pass --force after
   human review to install anyway.
 `);

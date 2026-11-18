@@ -48,7 +48,7 @@ Installs exactly one skill from a GitHub repo. Security pipeline:
 
 1. **Input validation** — repo and skill names are checked (`^[\w.-]+/[\w.-]+$`, `^[\w][\w.-]*$`) before any subprocess runs
 2. **Trusted owners** (anthropics, vercel-labs, github, firebase, trailofbits) — installed without scanning
-3. **Sandbox scan** (everyone else) — the skill is installed into a temporary sandbox dir first and *every* file is scanned (SKILL.md, `scripts/`, load-time hooks, ...)
+3. **Sandbox scan** (everyone else) — the skill is downloaded once into a temporary sandbox dir and *every* file is scanned (SKILL.md, `scripts/`, load-time hooks, ...). The scanned copy itself is then moved into `.claude/skills` — nothing is downloaded twice
 4. **Quarantine** — flagged skills are **not installed**; the flags are returned so a human can review. `--force` installs anyway after review
 
 ```bash
@@ -58,11 +58,13 @@ skills-manager install bobmatnyc/claude-mpm-skills vitest --force   # after huma
 
 Returns JSON: `{ installed, skillName, reason, flags }`.
 
-Note: the skills CLI also writes its own `skills-lock.json` to your project root — that's the CLI's install manifest, not skills-manager's registry.
+The installed directory is named after the skill's own frontmatter name (lowercased), which may differ from `<name>`; the returned `skillName` is the real one. A local skill with the same name in any letter case is never overwritten.
 
 ### evaluate
 
 Parses a `### Skills Report` section from a subagent response file and updates the local registry.
+
+A skill listed as `ignored` is marked useless only if it has never been used in any earlier run — one "not needed this time" doesn't get a previously useful skill removed.
 
 ```bash
 skills-manager evaluate /tmp/worker-response.txt orch-2026-03-28
@@ -137,7 +139,7 @@ let installed = 0
 for (const keyword of keywords) {
   if (installed >= 2) break  // max 2 external skills per orchestration
 
-  const output = execSync(`skills-manager search "${keyword}"`).toString()
+  const output = execFileSync("skills-manager", ["search", keyword]).toString()
   const json = JSON.parse(output.split("---JSON---")[1])
 
   // Already have a useful skill in registry — skip
@@ -146,7 +148,7 @@ for (const keyword of keywords) {
   // Let the orchestrator's LLM pick the candidate that fits the task — not blindly [0]
   if (json.fromWeb.length > 0) {
     const top = pickForTask(json.fromWeb, taskDescription)
-    execSync(`skills-manager install "${top.repo}" "${top.skill}"`)
+    execFileSync("skills-manager", ["install", top.repo, top.skill])
     installed++
   }
 }
@@ -174,20 +176,21 @@ At the end of your response, add:
 ```js
 const tmpFile = `${workspaceDir}/tmp-response.txt`
 writeFileSync(tmpFile, workerResponse)
-execSync(`skills-manager evaluate "${tmpFile}" "${orchestrationId}"`)
+execFileSync("skills-manager", ["evaluate", tmpFile, orchestrationId])
 unlinkSync(tmpFile)
 ```
 
 ### Phase 4.5 — Cleanup after all tasks complete
 
 ```js
-execSync("skills-manager cleanup")
+execFileSync("skills-manager", ["cleanup"])
 ```
 
 ## Security
 
-- All `skills` CLI invocations use `execFileSync` with argument arrays — repo and skill names are never interpolated into a shell string, and are additionally validated with a regexp before any subprocess runs.
-- Untrusted skills are installed into a sandbox dir first; every file of the skill (not just SKILL.md) is scanned before anything lands in the project.
+- All `skills` CLI invocations use `execFileSync` with argument arrays — repo and skill names are never interpolated into a shell string, and are additionally validated with a regexp before any subprocess runs. Call skills-manager the same way from your orchestrator: values from skills.sh are external data.
+- The `skills` CLI only downloads into a sandbox dir. skills-manager itself copies the scanned skill into `.claude/skills` and `cleanup` removes only that directory — skill dirs of other agents (`.agents/`, `.cursor/`, ...) are never touched.
+- Untrusted skills have every file (not just SKILL.md) scanned before anything lands in the project.
 
 Scanned patterns include:
 

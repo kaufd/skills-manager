@@ -67,12 +67,12 @@ describe("skills-manager: install flow", () => {
     const registryPath = join(projectDir, "trusted-registry.json");
     const result = await mod.install("anthropics/some-repo", "trusted-skill", registryPath);
     expect(result).toEqual({ installed: true, skillName: "trusted-skill", reason: "ok", flags: [] });
-    expect(calls).toHaveLength(1); // single real install, no sandbox run
+    expect(calls).toHaveLength(1); // single download, no scan
     expect(existsSync(join(projectDir, ".claude", "skills", "trusted-skill", "SKILL.md"))).toBe(true);
     expect((await mod.loadRegistry(registryPath)).skills["trusted-skill"]?.trusted).toBe(true);
   });
 
-  it("quarantines flagged untrusted skill and never installs it for real", async () => {
+  it("quarantines flagged untrusted skill and never copies it into the project", async () => {
     onExec((call) => {
       if (call.args.includes("add")) writeSkillSync(call.cwd ?? projectDir, "bad-skill", { "SKILL.md": MALICIOUS });
       return "";
@@ -82,7 +82,7 @@ describe("skills-manager: install flow", () => {
     expect(result.installed).toBe(false);
     expect(result.reason.startsWith("quarantine:")).toBe(true);
     expect(result.flags.length).toBeGreaterThan(0);
-    expect(calls).toHaveLength(1); // sandbox run only — real install never happened
+    expect(calls).toHaveLength(1); // sandbox download only
     expect(calls[0].cwd === projectDir).toBe(false);
     expect(existsSync(calls[0].cwd!)).toBe(false); // sandbox dir cleaned up
     expect(existsSync(join(projectDir, ".claude", "skills", "bad-skill"))).toBe(false);
@@ -99,7 +99,7 @@ describe("skills-manager: install flow", () => {
     expect(result.installed).toBe(true);
     expect(result.flags.length).toBeGreaterThan(0);
     expect(result.reason).toContain("force-installed");
-    expect(calls).toHaveLength(2); // sandbox + real install
+    expect(calls).toHaveLength(1); // one download, the scanned copy is moved
     expect((await mod.loadRegistry(registryPath)).skills["forced-skill"]).toBeDefined();
   });
 
@@ -111,7 +111,21 @@ describe("skills-manager: install flow", () => {
     const registryPath = join(projectDir, "clean-registry.json");
     const result = await mod.install("random-user/skill", "clean-skill", registryPath);
     expect(result).toEqual({ installed: true, skillName: "clean-skill", reason: "ok", flags: [] });
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(1); // no second download
+    expect(existsSync(join(projectDir, ".claude", "skills", "clean-skill", "SKILL.md"))).toBe(true);
+  });
+
+  it("installs the directory name the CLI actually created, not the requested name", async () => {
+    onExec((call) => {
+      if (call.args.includes("add")) writeSkillSync(call.cwd ?? projectDir, "vitest-pro", { "SKILL.md": CLEAN });
+      return "";
+    });
+    const registryPath = join(projectDir, "renamed-registry.json");
+    const result = await mod.install("random-user/skill", "vitest", registryPath);
+    expect(result.installed).toBe(true);
+    expect(result.skillName).toBe("vitest-pro");
+    expect(existsSync(join(projectDir, ".claude", "skills", "vitest-pro", "SKILL.md"))).toBe(true);
+    expect((await mod.loadRegistry(registryPath)).skills["vitest-pro"]).toBeDefined();
   });
 
   it("rejects malicious repo before any subprocess runs", async () => {
@@ -128,19 +142,16 @@ describe("skills-manager: install flow", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("rolls back when SKILL.md is missing after install", async () => {
+  it("refuses a download that has no SKILL.md and copies nothing", async () => {
     onExec((call) => {
-      // sandbox gets a clean skill; the real install writes nothing
-      if (call.args.includes("add") && call.cwd !== projectDir) {
-        writeSkillSync(call.cwd ?? projectDir, "ghost-skill", { "SKILL.md": CLEAN });
-      }
+      if (call.args.includes("add")) writeSkillSync(call.cwd ?? projectDir, "ghost-skill", { "README.md": "no skill here\n" });
       return "";
     });
     const registryPath = join(projectDir, "ghost-registry.json");
     const result = await mod.install("random-user/skill", "ghost-skill", registryPath);
     expect(result.installed).toBe(false);
-    expect(result.reason).toContain("rolled back");
-    expect(calls.some((c) => c.args.includes("remove"))).toBe(true);
+    expect(result.reason).toContain("SKILL.md not found");
+    expect(existsSync(join(projectDir, ".claude", "skills", "ghost-skill"))).toBe(false);
     expect((await mod.loadRegistry(registryPath)).skills).toEqual({});
   });
 
@@ -152,13 +163,21 @@ describe("skills-manager: install flow", () => {
     const result = await mod.install("random-user/skill", "net-skill", join(projectDir, "net-registry.json"));
     expect(result.installed).toBe(false);
     expect(result.reason).toContain("sandbox install failed");
-    expect(calls.filter((c) => c.args.includes("add"))).toHaveLength(1); // real install never ran
+    expect(calls.filter((c) => c.args.includes("add"))).toHaveLength(1);
     expect(existsSync(calls[0].cwd!)).toBe(false); // sandbox cleaned up even on failure
   });
 
   it("skips install when a local skill with the same name exists", async () => {
     writeSkillSync(projectDir, "existing-skill", { "SKILL.md": CLEAN });
     const result = await mod.install("owner/repo", "existing-skill", join(projectDir, "conflict-registry.json"));
+    expect(result.installed).toBe(false);
+    expect(result.reason).toContain("conflict");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("treats a local skill differing only in letter case as a conflict", async () => {
+    writeSkillSync(projectDir, "Case-Skill", { "SKILL.md": CLEAN });
+    const result = await mod.install("owner/repo", "case-skill", join(projectDir, "case-registry.json"));
     expect(result.installed).toBe(false);
     expect(result.reason).toContain("conflict");
     expect(calls).toHaveLength(0);
@@ -178,19 +197,9 @@ describe("skills-manager: cleanup flow", () => {
     };
   }
 
-  it("reports failed removals separately and keeps the registry entry", async () => {
-    const registryPath = join(projectDir, "cleanup-failed.json");
-    await mod.saveRegistry(registryPath, { skills: { "unused-skill": entry(false, "unused-skill") }, lastSearched: null });
-    onExec(() => {
-      throw new Error("remove failed");
-    });
-    const result = await mod.cleanup(registryPath);
-    expect(result).toEqual({ removed: [], failed: ["unused-skill"], kept: ["unused-skill"] });
-    expect((await mod.loadRegistry(registryPath)).skills["unused-skill"]).toBeDefined();
-  });
-
   it("removes useless skills and drops their registry entries", async () => {
     const registryPath = join(projectDir, "cleanup-ok.json");
+    writeSkillSync(projectDir, "useless-skill", { "SKILL.md": CLEAN });
     await mod.saveRegistry(registryPath, {
       skills: {
         "useless-skill": entry(false, "useless-skill"),
@@ -200,12 +209,13 @@ describe("skills-manager: cleanup flow", () => {
     });
     const result = await mod.cleanup(registryPath);
     expect(result).toEqual({ removed: ["useless-skill"], failed: [], kept: ["useful-skill"] });
+    expect(existsSync(join(projectDir, ".claude", "skills", "useless-skill"))).toBe(false);
     const after = await mod.loadRegistry(registryPath);
     expect(after.skills["useless-skill"]).toBeUndefined();
     expect(after.skills["useful-skill"]).toBeDefined();
   });
 
-  it("never passes an invalid registry name to a subprocess", async () => {
+  it("never passes an invalid registry name to the filesystem", async () => {
     const registryPath = join(projectDir, "cleanup-invalid.json");
     await mod.saveRegistry(registryPath, {
       skills: { "--global": entry(false, "--global") },
@@ -217,18 +227,23 @@ describe("skills-manager: cleanup flow", () => {
     expect((await mod.loadRegistry(registryPath)).skills).toEqual({});
   });
 
-  it("never removes skills on disk that are not in the registry", async () => {
+  it("removes only the project copy, never other agents' skill dirs or project-owned skills", async () => {
+    writeSkillSync(projectDir, "unused-skill", { "SKILL.md": CLEAN });
     writeSkillSync(projectDir, "some-project-skill", { "SKILL.md": "# Project skill\n" });
-    const registryPath = join(projectDir, "cleanup-project.json");
+    const otherAgent = join(projectDir, ".agents", "skills", "unused-skill");
+    mkdirSync(otherAgent, { recursive: true });
+    writeFileSync(join(otherAgent, "SKILL.md"), CLEAN);
+
+    const registryPath = join(projectDir, "cleanup-scope.json");
     await mod.saveRegistry(registryPath, {
       skills: { "unused-skill": entry(false, "unused-skill") },
       lastSearched: null,
     });
     await mod.cleanup(registryPath);
-    const removedNames = calls
-      .filter((c) => c.args.includes("remove"))
-      .map((c) => c.args[c.args.indexOf("-s") + 1]);
-    expect(removedNames).toEqual(["unused-skill"]);
+
+    expect(existsSync(join(projectDir, ".claude", "skills", "unused-skill"))).toBe(false);
+    expect(existsSync(join(otherAgent, "SKILL.md"))).toBe(true);
     expect(existsSync(join(projectDir, ".claude", "skills", "some-project-skill", "SKILL.md"))).toBe(true);
+    expect(calls).toHaveLength(0); // no skills CLI involved in removal
   });
 });

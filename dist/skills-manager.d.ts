@@ -53,9 +53,8 @@ declare function npx(args: string[], opts: {
     cwd: string;
     timeout?: number;
 }): void;
-/** Args for installing exactly one skill as a copy via the claude-code agent (target dir is the CLI's cwd). */
+/** Args for downloading exactly one skill as a copy via the claude-code agent (target dir is the CLI's cwd). */
 declare function buildInstallArgs(repo: string, skillName: string): string[];
-declare function buildRemoveArgs(skillName: string): string[];
 /** Names of skills physically present in the local skills dir (project-owned or installed). */
 declare function getLocalSkillNames(skillsDir?: string): string[];
 declare function shouldSkipInstall(skillName: string, localSkills: string[]): boolean;
@@ -66,9 +65,10 @@ interface InstallResult {
     flags: string[];
 }
 /**
- * Installs exactly one skill. Untrusted repos are installed into a throwaway
- * sandbox dir first and every file is scanned; flagged skills are quarantined
- * (not installed) unless opts.force is set after human review.
+ * Installs exactly one skill. Every repo is downloaded once into a throwaway
+ * sandbox dir; untrusted ones are scanned there (flagged skills are quarantined
+ * unless opts.force is set after human review). The very copy that was scanned
+ * is then moved into .claude/skills — nothing is downloaded a second time.
  */
 declare function install(repo: string, skillName: string, registryPath?: string, opts?: {
     force?: boolean;
@@ -98,4 +98,4 @@ declare function parseArgs(argv: string[]): {
     args: string[];
 };
 
-export { DEFAULT_REGISTRY, type InstallResult, REGISTRY_PATH_DEFAULT, SKILLS_CLI_VERSION, SKILLS_DIR, type ScanResult, type SkillCandidate, type SkillEntry, type SkillsRegistry, type SkillsReport, TRUSTED_OWNERS, buildInstallArgs, buildRemoveArgs, cleanup, evaluateSkills, getLocalSkillNames, getSkillsToRemove, install, isTrustedOwner, loadRegistry, npx, parseArgs, parseSkillsReport, saveRegistry, scanSkillContent, scanSkillDir, scanSkillFile, search, searchRegistry, searchSkillsSh, shouldSkipInstall, validateRepo, validateSkillName };
+export { DEFAULT_REGISTRY, type InstallResult, REGISTRY_PATH_DEFAULT, SKILLS_CLI_VERSION, SKILLS_DIR, type ScanResult, type SkillCandidate, type SkillEntry, type SkillsRegistry, type SkillsReport, TRUSTED_OWNERS, buildInstallArgs, cleanup, evaluateSkills, getLocalSkillNames, getSkillsToRemove, install, isTrustedOwner, loadRegistry, npx, parseArgs, parseSkillsReport, saveRegistry, scanSkillContent, scanSkillDir, scanSkillFile, search, searchRegistry, searchSkillsSh, shouldSkipInstall, validateRepo, validateSkillName };

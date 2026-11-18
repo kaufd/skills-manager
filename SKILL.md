@@ -41,7 +41,7 @@ skills-manager install bobmatnyc/claude-mpm-skills vitest --force
 Четыре уровня безопасности:
 1. Валидация входов — repo и имя скилла проверяются регэкспом до запуска любого процесса
 2. Trusted owners (anthropics, vercel-labs, github, ...) — устанавливается без сканирования
-3. Sandbox-сканирование — скилл ставится во временную папку, сканируются все файлы (SKILL.md, scripts/, синтаксис `` !`cmd` ``, hooks)
+3. Sandbox-сканирование — скилл скачивается один раз во временную папку, сканируются все файлы (SKILL.md, scripts/, синтаксис `` !`cmd` ``, hooks); в `.claude/skills` переносится именно проверенная копия. Каталог называется по имени из frontmatter скилла (в нижнем регистре) — реальное имя возвращается в `skillName`
 4. Карантин — скилл с флагами НЕ устанавливается, флаги возвращаются оркестратору; `--force` ставит после подтверждения человеком
 
 ### evaluate — обработка Skills Report субагента
@@ -50,6 +50,7 @@ skills-manager evaluate /path/to/response.txt orch-2026-03-28
 ```
 
 Парсит раздел `### Skills Report` из ответа субагента и обновляет реестр.
+Скилл из `ignored` помечается бесполезным, только если его ни разу не использовали в прошлых запусках.
 
 ### cleanup — удаление бесполезных скиллов
 ```bash
@@ -93,7 +94,7 @@ let externalSkillsInstalled = 0
 for (const keyword of keywords) {
   if (externalSkillsInstalled >= 2) break  // макс 2 внешних скилла
 
-  const output = execSync(`skills-manager search "${keyword}"`)
+  const output = execFileSync("skills-manager", ["search", keyword])
   const json = JSON.parse(output.split("---JSON---")[1])
 
   // Есть useful:true в реестре → ставим
@@ -106,7 +107,7 @@ for (const keyword of keywords) {
   // Есть на skills.sh → LLM оркестратора выбирает кандидата под задачу, не слепо [0]
   if (json.fromWeb.length > 0) {
     const top = pickForTask(json.fromWeb, taskDescription)
-    execSync(`skills-manager install "${top.repo}" "${top.skill}"`)
+    execFileSync("skills-manager", ["install", top.repo, top.skill])
     externalSkillsInstalled++
   }
 }
@@ -134,14 +135,14 @@ for (const keyword of keywords) {
 ```javascript
 const tmpFile = `${workspaceDir}/tmp-response.txt`
 writeFileSync(tmpFile, workerResponse)
-execSync(`skills-manager evaluate "${tmpFile}" "${orchestrationId}"`)
+execFileSync("skills-manager", ["evaluate", tmpFile, orchestrationId])
 rmSync(tmpFile)
 ```
 
 ### Phase 4.5: Cleanup
 
 ```javascript
-const result = execSync('skills-manager cleanup')
+const result = execFileSync("skills-manager", ["cleanup"])
 ```
 
 ## Реестр
