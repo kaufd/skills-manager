@@ -1,6 +1,6 @@
 {
   "name": "@thirdchimp/skills-manager",
-  "version": "1.0.3",
+  "version": "2.0.0",
   "description": "Dynamic skill discovery, install, evaluate and cleanup from skills.sh for AI agent orchestrators",
   "keywords": [
     "skills",
