@@ -1,4 +1,6 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { readFile, writeFile, rm, mkdtemp, mkdir, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -124,31 +126,28 @@ describe("skills-manager: search", () => {
 describe("skills-manager: searchSkillsSh", () => {
   it("returns empty array on network error", async () => {
     const { searchSkillsSh } = await import("../src/skills-manager");
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = () => Promise.reject(new Error("Network error"));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("Network error"));
     try {
       const results = await searchSkillsSh("anything");
       expect(results).toEqual([]);
     } finally {
-      globalThis.fetch = origFetch;
+      fetchMock.mockRestore();
     }
   });
 
   it("parses skills.sh response into candidates, keeping the API relevance order", async () => {
     const { searchSkillsSh } = await import("../src/skills-manager");
-    const origFetch = globalThis.fetch;
-    globalThis.fetch = () =>
-      Promise.resolve(
-        new Response(
-          JSON.stringify({
-            skills: [
-              { name: "vitest", source: "bobmatnyc/claude-mpm-skills", installs: 45 },
-              { name: "owasp", source: "hoodini/ai-agents-skills", installs: 120 },
-            ],
-          }),
-          { status: 200 },
-        ),
-      );
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          skills: [
+            { name: "vitest", source: "bobmatnyc/claude-mpm-skills", installs: 45 },
+            { name: "owasp", source: "hoodini/ai-agents-skills", installs: 120 },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
     try {
       const results = await searchSkillsSh("testing");
       expect(results).toEqual([
@@ -156,7 +155,7 @@ describe("skills-manager: searchSkillsSh", () => {
         { skill: "owasp", repo: "hoodini/ai-agents-skills", installs: 120 },
       ]);
     } finally {
-      globalThis.fetch = origFetch;
+      fetchMock.mockRestore();
     }
   });
 });
@@ -453,6 +452,28 @@ describe("skills-manager: cleanup", () => {
 });
 
 describe("skills-manager: CLI", () => {
+  it("retains usage reports from concurrent CLI sessions", async () => {
+    const project = await mkdtemp(join(tmpdir(), "skills-manager-concurrent-"));
+    const registry = join(project, ".claude", "skills-registry.json");
+    const report = join(project, "report.md");
+    const cli = join(import.meta.dirname, "../dist/skills-manager.js");
+    const ids = Array.from({ length: 8 }, (_, i) => `session-${i}`);
+    try {
+      await mkdir(join(project, ".claude"));
+      await writeFile(registry, JSON.stringify({ skills: {
+        example: { skill: "example", usedIn: [], useful: null },
+      }, lastSearched: null }));
+      await writeFile(report, "### Skills Report\n- used: example\n");
+      await Promise.all(ids.map(id =>
+        promisify(execFile)(process.execPath, [cli, "evaluate", report, id], { cwd: project })
+      ));
+      const saved = JSON.parse(await readFile(registry, "utf8"));
+      expect(saved.skills.example.usedIn.sort()).toEqual(ids);
+    } finally {
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
   it("parseArgs extracts command and arguments", async () => {
     const { parseArgs } = await import("../src/skills-manager");
 

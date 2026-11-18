@@ -14,6 +14,8 @@ interface SkillEntry {
     lastUsed: string | null;
     installedAt: string;
     trusted: boolean;
+    contentHash?: string;
+    directoryId?: string;
 }
 interface SkillsRegistry {
     skills: Record<string, SkillEntry>;
@@ -63,15 +65,15 @@ interface InstallResult {
     skillName: string;
     reason: string;
     flags: string[];
+    contentHash?: string;
 }
 /**
  * Installs exactly one skill. Every repo is downloaded once into a throwaway
- * sandbox dir; untrusted ones are scanned there (flagged skills are quarantined
- * unless opts.force is set after human review). The very copy that was scanned
- * is then moved into .claude/skills — nothing is downloaded a second time.
+ * sandbox dir. An untrusted skill with flags requires approval of its exact
+ * tree hash. The project copy is verified against the original download.
  */
 declare function install(repo: string, skillName: string, registryPath?: string, opts?: {
-    force?: boolean;
+    force?: string;
 }): Promise<InstallResult>;
 interface SkillsReport {
     used: string[];
@@ -92,6 +94,7 @@ declare function cleanup(registryPath?: string): Promise<{
     removed: string[];
     failed: string[];
     kept: string[];
+    preserved: string[];
 }>;
 declare function parseArgs(argv: string[]): {
     command: string;

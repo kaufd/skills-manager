@@ -7,11 +7,13 @@
  *        npx @thirdchimp/skills-manager <command> [args]
  */
 
-import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
-import { existsSync, readdirSync } from "node:fs";
+import { chmod, cp, lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, rename, rm, writeFile } from "node:fs/promises";
+import { constants, existsSync, readdirSync, type Stats } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { basename, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import lockfile from "proper-lockfile";
 
 // --- Types ---
 
@@ -23,6 +25,8 @@ export interface SkillEntry {
   lastUsed: string | null;
   installedAt: string;
   trusted: boolean;
+  contentHash?: string;
+  directoryId?: string;
 }
 
 export interface SkillsRegistry {
@@ -45,6 +49,29 @@ export const SKILLS_DIR = join(process.cwd(), ".claude", "skills");
 
 // --- Registry ---
 
+async function ensureRegistryDirectory(path: string): Promise<void> {
+  const directory = dirname(path);
+  await mkdir(directory, { recursive: true });
+  if (!(await lstat(directory)).isDirectory()) {
+    throw new Error(`Registry parent must be a directory: ${directory}`);
+  }
+}
+
+async function withRegistryLock<T>(path: string, update: () => Promise<T>): Promise<T> {
+  await ensureRegistryDirectory(path);
+  // Lock a stable sibling: the registry may not exist yet and saves replace its inode.
+  const release = await lockfile.lock(path, {
+    realpath: false,
+    stale: 120_000,
+    retries: { retries: 32, minTimeout: 20, maxTimeout: 500, randomize: true },
+  });
+  try {
+    return await update();
+  } finally {
+    await release();
+  }
+}
+
 export async function loadRegistry(path: string = REGISTRY_PATH_DEFAULT): Promise<SkillsRegistry> {
   if (!existsSync(path)) return { ...DEFAULT_REGISTRY, skills: {} };
   const raw = await readFile(path, "utf-8");
@@ -55,11 +82,14 @@ export async function saveRegistry(
   path: string = REGISTRY_PATH_DEFAULT,
   registry: SkillsRegistry,
 ): Promise<void> {
-  // Write-then-rename so an interrupted write never leaves a truncated registry.
-  // simplicity: concurrent sessions can still lose each other's updates (last write wins); add a lock if that bites
-  const tmp = `${path}.${process.pid}.tmp`;
-  await writeFile(tmp, JSON.stringify(registry, null, 2), "utf-8");
-  await rename(tmp, path);
+  await ensureRegistryDirectory(path);
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, JSON.stringify(registry, null, 2), { flag: "wx", mode: 0o600 });
+    await rename(tmp, path);
+  } finally {
+    await rm(tmp, { force: true });
+  }
 }
 
 // --- Search ---
@@ -169,20 +199,31 @@ export function scanSkillContent(content: string): ScanResult {
 }
 
 const MAX_SCAN_FILE_BYTES = 512 * 1024;
+const READ_SKILL_FILE = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 
 // Anything we cannot scan is flagged, never trusted: a padded or NUL-prefixed
 // file must land in quarantine for human review, not silently pass.
 export async function scanSkillFile(path: string): Promise<ScanResult> {
   let content: Buffer;
   try {
-    const info = await stat(path);
-    if (info.size > MAX_SCAN_FILE_BYTES) {
-      return { safe: false, flags: [`file too large to scan: ${basename(path)}`] };
+    const file = await open(path, READ_SKILL_FILE);
+    try {
+      const info = await file.stat();
+      if (!info.isFile()) throw new Error("not a regular file");
+      if (info.size > MAX_SCAN_FILE_BYTES) {
+        return { safe: false, flags: [`file too large to scan: ${basename(path)}`] };
+      }
+      content = await file.readFile();
+    } finally {
+      await file.close();
     }
-    content = await readFile(path);
   } catch {
     return { safe: false, flags: [`unreadable file: ${basename(path)}`] };
   }
+  return scanSkillBytes(content, path);
+}
+
+function scanSkillBytes(content: Buffer, path: string): ScanResult {
   if (content.includes(0)) {
     return { safe: false, flags: [`binary file in skill: ${basename(path)}`] };
   }
@@ -191,26 +232,12 @@ export async function scanSkillFile(path: string): Promise<ScanResult> {
 
 /** Scans every file of an installed skill tree (SKILL.md, scripts/, ...). Fails closed. */
 export async function scanSkillDir(skillDir: string): Promise<ScanResult> {
-  let entries;
   try {
-    entries = await readdir(skillDir, { withFileTypes: true });
+    const { flags } = await inspectSkillTree(skillDir, basename(skillDir), true);
+    return { safe: flags.length === 0, flags };
   } catch {
     return { safe: false, flags: ["skill directory not found or unreadable"] };
   }
-  const flags: string[] = [];
-  for (const entry of entries) {
-    const full = join(skillDir, entry.name);
-    if (entry.isDirectory()) {
-      flags.push(...(await scanSkillDir(full)).flags);
-    } else if (entry.isFile()) {
-      flags.push(...(await scanSkillFile(full)).flags);
-    } else {
-      // symlink, fifo, ... — the real install would materialize it, we cannot scan through it
-      flags.push(`suspicious: non-regular file in skill directory: ${entry.name}`);
-    }
-  }
-  const unique = [...new Set(flags)];
-  return { safe: unique.length === 0, flags: unique };
 }
 
 // --- Install ---
@@ -268,30 +295,121 @@ export function shouldSkipInstall(skillName: string, localSkills: string[]): boo
   return localSkills.some((s) => s.toLowerCase() === name);
 }
 
+const SHA256_PATTERN = /^[a-f0-9]{64}$/i;
+
+async function pathInfo(path: string): Promise<Stats | undefined> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function hasRealSkillParents(skillsDir: string): Promise<boolean> {
+  for (const path of [dirname(skillsDir), skillsDir]) {
+    const info = await pathInfo(path);
+    if (info && !info.isDirectory()) return false;
+  }
+  return true;
+}
+
+function fileIdentity(info: Stats): string {
+  return `${info.dev}:${info.ino}:${info.birthtimeMs}`;
+}
+
+/** Hash the same bytes the scanner checks and record modes that cp does not preserve. */
+async function inspectSkillTree(root: string, name: string, scan = false) {
+  const hash = createHash("sha256");
+  const flags = new Set<string>();
+  const directoryModes: { relative: string; mode: number }[] = [];
+  let hasSymlinks = false;
+  const rootInfo = await lstat(root);
+  if (!rootInfo.isDirectory()) throw new Error("skill root is not a directory");
+  hash.update(JSON.stringify(name) + "\n");
+
+  async function visit(path: string, relative: string, info: Stats): Promise<void> {
+    const mode = info.mode & 0o7777;
+    if (info.isDirectory()) {
+      hash.update(JSON.stringify(["directory", relative, mode]) + "\n");
+      directoryModes.push({ relative, mode });
+      const children = await readdir(path, { encoding: "buffer" });
+      children.sort(Buffer.compare);
+      for (const raw of children) {
+        const child = raw.toString("utf8");
+        if (!Buffer.from(child).equals(raw)) throw new Error("unsupported non-UTF-8 skill path");
+        const childPath = join(path, child);
+        await visit(childPath, relative ? `${relative}/${child}` : child, await lstat(childPath));
+      }
+      return;
+    }
+    if (info.isSymbolicLink()) {
+      const link = await readlink(path, { encoding: "buffer" });
+      hash.update(JSON.stringify(["symlink", relative, mode, link.toString("base64")]) + "\n");
+      hasSymlinks = true;
+      if (scan) flags.add(`suspicious: non-regular file in skill directory: ${basename(path)}`);
+      return;
+    }
+    if (!info.isFile()) throw new Error(`unsupported file in skill tree: ${relative}`);
+
+    const file = await open(path, READ_SKILL_FILE);
+    try {
+      const opened = await file.stat();
+      if (!opened.isFile() || opened.mode !== info.mode || fileIdentity(opened) !== fileIdentity(info)) {
+        throw new Error(`file changed while reading skill tree: ${relative}`);
+      }
+      const digest = createHash("sha256");
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      for await (const chunk of file.createReadStream({ autoClose: false })) {
+        digest.update(chunk);
+        bytes += chunk.length;
+        if (scan && bytes <= MAX_SCAN_FILE_BYTES) chunks.push(chunk);
+      }
+      hash.update(JSON.stringify(["file", relative, mode, digest.digest("hex")]) + "\n");
+      if (scan) {
+        if (bytes > MAX_SCAN_FILE_BYTES) flags.add(`file too large to scan: ${basename(path)}`);
+        else for (const flag of scanSkillBytes(Buffer.concat(chunks), path).flags) flags.add(flag);
+      }
+    } finally {
+      await file.close();
+    }
+  }
+
+  await visit(root, "", rootInfo);
+  return { contentHash: hash.digest("hex"), flags: [...flags], directoryModes, hasSymlinks };
+}
+
 export interface InstallResult {
   installed: boolean;
   skillName: string;
   reason: string;
   flags: string[];
+  contentHash?: string;
 }
 
 /**
  * Installs exactly one skill. Every repo is downloaded once into a throwaway
- * sandbox dir; untrusted ones are scanned there (flagged skills are quarantined
- * unless opts.force is set after human review). The very copy that was scanned
- * is then moved into .claude/skills — nothing is downloaded a second time.
+ * sandbox dir. An untrusted skill with flags requires approval of its exact
+ * tree hash. The project copy is verified against the original download.
  */
 export async function install(
   repo: string,
   skillName: string,
   registryPath: string = REGISTRY_PATH_DEFAULT,
-  opts: { force?: boolean } = {},
+  opts: { force?: string } = {},
 ): Promise<InstallResult> {
   if (!validateRepo(repo)) {
     return { installed: false, skillName, reason: "invalid repo", flags: [] };
   }
   if (!validateSkillName(skillName)) {
     return { installed: false, skillName, reason: "invalid skill name", flags: [] };
+  }
+  if (opts.force !== undefined && (typeof opts.force !== "string" || !SHA256_PATTERN.test(opts.force))) {
+    return { installed: false, skillName, reason: "--force requires a SHA-256 content hash", flags: [] };
+  }
+  if (!await hasRealSkillParents(SKILLS_DIR)) {
+    return { installed: false, skillName, reason: "unsafe project skills directory", flags: [] };
   }
   // Cheap early exit; the authoritative check below uses the real directory name.
   if (shouldSkipInstall(skillName, getLocalSkillNames())) {
@@ -309,6 +427,9 @@ export async function install(
     // The CLI names the directory after the skill's frontmatter name (lowercased,
     // sanitized), not after --skill, so read the real name from disk.
     const sandboxSkills = join(sandbox, ".claude", "skills");
+    if (!await hasRealSkillParents(sandboxSkills)) {
+      return { installed: false, skillName, reason: "unsafe sandbox skills directory", flags: [] };
+    }
     const dirs = getLocalSkillNames(sandboxSkills);
     if (dirs.length !== 1) {
       return { installed: false, skillName, reason: `expected exactly one skill in download, got ${dirs.length}`, flags: [] };
@@ -318,47 +439,92 @@ export async function install(
     if (!validateSkillName(dirName)) {
       return { installed: false, skillName, reason: `invalid installed directory name "${dirName}"`, flags: [] };
     }
-    if (!existsSync(join(source, "SKILL.md"))) {
+    const sourceInfo = await pathInfo(source);
+    if (!sourceInfo?.isDirectory()) {
+      return { installed: false, skillName: dirName, reason: "unsafe downloaded skill directory", flags: [] };
+    }
+    const instructions = await pathInfo(join(source, "SKILL.md"));
+    if (instructions?.isSymbolicLink()) {
+      return { installed: false, skillName: dirName, reason: "SKILL.md must be a regular file", flags: [] };
+    }
+    if (!instructions?.isFile()) {
       return { installed: false, skillName: dirName, reason: "SKILL.md not found in download", flags: [] };
     }
-    if (shouldSkipInstall(dirName, getLocalSkillNames())) {
-      return { installed: false, skillName: dirName, reason: `conflict: local skill "${dirName}" already exists`, flags: [] };
-    }
-
-    let flags: string[] = [];
-    if (!isTrustedOwner(repo)) {
-      flags = (await scanSkillDir(source)).flags;
-      if (flags.length > 0 && !opts.force) {
-        return { installed: false, skillName: dirName, reason: `quarantine: ${flags.join(", ")}`, flags };
-      }
-    }
-
-    // Copy next to the target, then rename: the target never exists half-written,
-    // and rename refuses to replace a non-empty directory that appeared meanwhile.
-    await mkdir(SKILLS_DIR, { recursive: true });
-    const staging = join(SKILLS_DIR, `.${dirName}.${process.pid}.tmp`);
+    const trusted = isTrustedOwner(repo);
+    let tree;
     try {
-      await cp(source, staging, { recursive: true, errorOnExist: true, force: false });
-      await rename(staging, join(SKILLS_DIR, dirName));
+      tree = await inspectSkillTree(source, dirName, !trusted);
     } catch (err) {
-      await rm(staging, { recursive: true, force: true });
-      return { installed: false, skillName: dirName, reason: `copy failed: ${String(err)}`, flags };
+      return { installed: false, skillName: dirName, reason: `cannot inspect download: ${String(err)}`, flags: [] };
     }
 
-    const registry = await loadRegistry(registryPath);
-    registry.skills[dirName] = {
-      repo,
-      skill: dirName,
-      usedIn: [],
-      useful: null,
-      lastUsed: null,
-      installedAt: new Date().toISOString().split("T")[0],
-      trusted: isTrustedOwner(repo),
-    };
-    await saveRegistry(registryPath, registry);
+    const { contentHash, flags, directoryModes, hasSymlinks } = tree;
+    if (hasSymlinks) {
+      return { installed: false, skillName: dirName, reason: "symbolic links are not supported in skill downloads", flags, contentHash };
+    }
+    if (opts.force !== undefined && opts.force.toLowerCase() !== contentHash) {
+      return { installed: false, skillName: dirName, reason: "reviewed content hash does not match download", flags, contentHash };
+    }
+    if (flags.length > 0 && opts.force === undefined) {
+      return { installed: false, skillName: dirName, reason: `quarantine: ${flags.join(", ")}`, flags, contentHash };
+    }
 
-    const reason = flags.length > 0 ? `force-installed despite flags: ${flags.join(", ")}` : "ok";
-    return { installed: true, skillName: dirName, reason, flags };
+    return await withRegistryLock(registryPath, async () => {
+      if (!await hasRealSkillParents(SKILLS_DIR)) {
+        return { installed: false, skillName: dirName, reason: "unsafe project skills directory", flags, contentHash };
+      }
+      if (shouldSkipInstall(dirName, getLocalSkillNames())) {
+        return { installed: false, skillName: dirName, reason: `conflict: local skill "${dirName}" already exists`, flags, contentHash };
+      }
+
+      const registry = await loadRegistry(registryPath);
+      const destination = join(SKILLS_DIR, dirName);
+      await mkdir(SKILLS_DIR, { recursive: true });
+      const staging = await mkdtemp(join(SKILLS_DIR, ".skills-manager-"));
+      const stagedSkill = join(staging, dirName);
+      let directoryId: string;
+      try {
+        await cp(source, stagedSkill, { recursive: true, verbatimSymlinks: true, errorOnExist: true, force: false });
+        for (const { relative } of directoryModes) {
+          if (!(await lstat(join(stagedSkill, relative))).isDirectory()) {
+            throw new Error("copied directory differs from checked download");
+          }
+        }
+        for (const { relative, mode } of directoryModes.reverse()) {
+          await chmod(join(stagedSkill, relative), mode);
+        }
+        const staged = await inspectSkillTree(stagedSkill, dirName);
+        if (staged.contentHash !== contentHash) throw new Error("copied tree differs from checked download");
+        directoryId = fileIdentity(await lstat(stagedSkill));
+        await rename(stagedSkill, destination);
+      } catch (err) {
+        return { installed: false, skillName: dirName, reason: `copy failed: ${String(err)}`, flags, contentHash };
+      } finally {
+        await rm(staging, { recursive: true, force: true });
+      }
+
+      const entry = {
+        repo,
+        skill: dirName,
+        usedIn: [],
+        useful: null,
+        lastUsed: null,
+        installedAt: new Date().toISOString().split("T")[0],
+        trusted,
+        contentHash,
+        directoryId,
+      };
+      registry.skills = { ...registry.skills, [dirName]: entry };
+      try {
+        await saveRegistry(registryPath, registry);
+      } catch (err) {
+        await removeMatchingSkill(dirName, entry).catch(() => false);
+        throw err;
+      }
+
+      const reason = flags.length > 0 ? `force-installed despite flags: ${flags.join(", ")}` : "ok";
+      return { installed: true, skillName: dirName, reason, flags, contentHash };
+    });
   } finally {
     await rm(sandbox, { recursive: true, force: true });
   }
@@ -404,7 +570,7 @@ export function evaluateSkills(
   const today = new Date().toISOString().split("T")[0];
 
   for (const name of report.used) {
-    if (registry.skills[name]) {
+    if (Object.hasOwn(registry.skills, name)) {
       registry.skills[name].useful = true;
       registry.skills[name].lastUsed = today;
       if (!registry.skills[name].usedIn.includes(report.orchestrationId)) {
@@ -416,7 +582,7 @@ export function evaluateSkills(
   // "Not needed for this task" must not outvote earlier runs where the skill was used.
   for (const name of report.ignored) {
     const entry = registry.skills[name];
-    if (entry && entry.usedIn.length === 0) {
+    if (Object.hasOwn(registry.skills, name) && entry.usedIn.length === 0) {
       entry.useful = false;
     }
   }
@@ -440,36 +606,58 @@ export function getSkillsToRemove(registry: SkillsRegistry, protectedNames: stri
     .map((s) => s.skill);
 }
 
-export async function cleanup(
-  registryPath: string = REGISTRY_PATH_DEFAULT,
-): Promise<{ removed: string[]; failed: string[]; kept: string[] }> {
-  const registry = await loadRegistry(registryPath);
-  const toRemove = getSkillsToRemove(registry, []);
-
-  const removed: string[] = [];
-  const failed: string[] = [];
-  for (const name of toRemove) {
-    if (!validateSkillName(name)) {
-      // install() only writes valid names; a hand-edited registry must never
-      // reach the filesystem as a path. Surface it and drop the unusable entry.
-      failed.push(name);
-      delete registry.skills[name];
-      continue;
-    }
-    try {
-      // Only the copy install() made; other agents' skill dirs are never touched.
-      await rm(join(SKILLS_DIR, name), { recursive: true, force: true });
-      removed.push(name);
-      delete registry.skills[name]; // entry is dropped only after a successful removal
-    } catch {
-      failed.push(name);
-    }
+async function removeMatchingSkill(name: string, entry: SkillEntry | undefined): Promise<boolean> {
+  if (!await hasRealSkillParents(SKILLS_DIR)) return false;
+  const path = join(SKILLS_DIR, name);
+  const info = await pathInfo(path);
+  if (!info) return true;
+  if (!info.isDirectory() || !entry?.contentHash || fileIdentity(info) !== entry.directoryId) {
+    return false;
   }
 
-  const kept = Object.keys(registry.skills);
+  const { contentHash } = await inspectSkillTree(path, name);
+  if (contentHash !== entry.contentHash || !await hasRealSkillParents(SKILLS_DIR)) return false;
+  const current = await pathInfo(path);
+  if (!current?.isDirectory() || fileIdentity(current) !== entry.directoryId) return false;
 
-  await saveRegistry(registryPath, registry);
-  return { removed, failed, kept };
+  await rm(path, { recursive: true });
+  return true;
+}
+
+export async function cleanup(
+  registryPath: string = REGISTRY_PATH_DEFAULT,
+): Promise<{ removed: string[]; failed: string[]; kept: string[]; preserved: string[] }> {
+  return withRegistryLock(registryPath, async () => {
+    const registry = await loadRegistry(registryPath);
+    const toRemove = getSkillsToRemove(registry, []);
+
+    const removed: string[] = [];
+    const failed: string[] = [];
+    const preserved: string[] = [];
+    for (const name of toRemove) {
+      if (!validateSkillName(name)) {
+        // install() only writes valid names; never use an invalid registry name as a path.
+        failed.push(name);
+        delete registry.skills[name];
+        continue;
+      }
+      try {
+        const entry = Object.hasOwn(registry.skills, name) ? registry.skills[name] : undefined;
+        if (entry?.useful === true || !await removeMatchingSkill(name, entry)) {
+          preserved.push(name);
+          continue;
+        }
+        removed.push(name);
+        delete registry.skills[name];
+      } catch {
+        failed.push(name);
+      }
+    }
+
+    const kept = Object.keys(registry.skills);
+    await saveRegistry(registryPath, registry);
+    return { removed, failed, kept, preserved };
+  });
 }
 
 // --- CLI ---
@@ -489,7 +677,7 @@ Usage:
 
 Commands:
   search <query> [limit]            Search skills (local registry → skills.sh), default 10
-  install <owner/repo> <name> [--force]
+  install <owner/repo> <name> [--force <sha256>]
                                     Install a skill with security scanning
   evaluate <response-file> <id>     Parse Skills Report from subagent response
   cleanup                           Remove unused skills
@@ -499,7 +687,7 @@ Commands:
 Examples:
   skills-manager search vitest
   skills-manager install bobmatnyc/claude-mpm-skills vitest
-  skills-manager install bobmatnyc/claude-mpm-skills vitest --force
+  skills-manager install bobmatnyc/claude-mpm-skills vitest --force <approved-sha256>
   skills-manager evaluate /tmp/response.txt orch-2026-03-28
   skills-manager cleanup
   skills-manager list
@@ -513,8 +701,8 @@ Security:
   Every skill is downloaded once into a sandbox dir; untrusted ones have
   every file scanned there (SKILL.md, scripts/, load-time hooks). The
   scanned copy itself is moved into .claude/skills. Flagged skills are
-  quarantined: NOT installed, flags are returned. Pass --force after
-  human review to install anyway.
+  quarantined: review the flags and contentHash. Use --force <sha256>
+  with the approved hash to install the reviewed version.
 `);
 }
 
@@ -552,11 +740,11 @@ async function main() {
     }
 
     case "install": {
-      const force = args.includes("--force");
-      const [repo, skillName] = args.filter((a) => a !== "--force");
-      if (!repo || !skillName) {
+      const [repo, skillName, option, force] = args;
+      if (!repo || !skillName || (args.length !== 2 &&
+        (args.length !== 4 || option !== "--force" || !SHA256_PATTERN.test(force)))) {
         console.error(
-          "Error: repo and name required\nUsage: skills-manager install <owner/repo> <skill-name> [--force]",
+          "Usage: skills-manager install <owner/repo> <skill-name> [--force <sha256>]",
         );
         process.exit(1);
       }
@@ -576,10 +764,12 @@ async function main() {
       }
       const response = await readFile(responseFile, "utf-8");
       const report = parseSkillsReport(response);
-      const registry = await loadRegistry();
-      const updated = evaluateSkills(registry, { ...report, orchestrationId: orchId });
-      await saveRegistry(REGISTRY_PATH_DEFAULT, updated);
-      console.log(JSON.stringify({ report, updated: Object.keys(updated.skills) }));
+      const updated = await withRegistryLock(REGISTRY_PATH_DEFAULT, async () => {
+        const registry = evaluateSkills(await loadRegistry(), { ...report, orchestrationId: orchId });
+        await saveRegistry(REGISTRY_PATH_DEFAULT, registry);
+        return Object.keys(registry.skills);
+      });
+      console.log(JSON.stringify({ report, updated }));
       break;
     }
 
@@ -588,6 +778,9 @@ async function main() {
       console.log(`Removed: ${result.removed.join(", ") || "none"}`);
       if (result.failed.length > 0) {
         console.log(`Failed:  ${result.failed.join(", ")}`);
+      }
+      if (result.preserved.length > 0) {
+        console.log(`Preserved: ${result.preserved.join(", ")}`);
       }
       console.log(`Kept:    ${result.kept.join(", ") || "none"}`);
       console.log(JSON.stringify(result));

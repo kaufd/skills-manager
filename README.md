@@ -21,7 +21,7 @@ skills-manager <command> [args]
 
 Commands:
   search <query>                    Search skills (local registry → skills.sh)
-  install <owner/repo> <name> [--force]
+  install <owner/repo> <name> [--force <sha256>]
                                     Install a skill with security scanning
   evaluate <response-file> <id>     Parse Skills Report from subagent response
   cleanup                           Remove unused skills
@@ -49,14 +49,14 @@ Installs exactly one skill from a GitHub repo. Security pipeline:
 1. **Input validation** — repo and skill names are checked (`^[\w.-]+/[\w.-]+$`, `^[\w][\w.-]*$`) before any subprocess runs
 2. **Trusted owners** (anthropics, vercel-labs, github, firebase, trailofbits) — installed without scanning
 3. **Sandbox scan** (everyone else) — the skill is downloaded once into a temporary sandbox dir and *every* file is scanned (SKILL.md, `scripts/`, load-time hooks, ...). The scanned copy itself is then moved into `.claude/skills` — nothing is downloaded twice
-4. **Quarantine** — flagged skills are **not installed**; the flags are returned so a human can review. `--force` installs anyway after review
+4. **Quarantine** — the result includes the flags and a SHA-256 `contentHash` for review. After the user approves this version, pass its hash to install it. A changed download requires a new review. Installation requires a regular `SKILL.md` and a tree without symbolic links so every installed file is covered by the hash.
 
 ```bash
 skills-manager install bobmatnyc/claude-mpm-skills vitest
-skills-manager install bobmatnyc/claude-mpm-skills vitest --force   # after human review
+skills-manager install bobmatnyc/claude-mpm-skills vitest --force "$approved_hash"  # contentHash approved by the user
 ```
 
-Returns JSON: `{ installed, skillName, reason, flags }`.
+The JSON result includes `installed`, `skillName`, `reason`, and `flags`. A successful installation or a reviewable download also includes `contentHash`.
 
 The installed directory is named after the skill's own frontmatter name (lowercased), which may differ from `<name>`; the returned `skillName` is the real one. A local skill with the same name in any letter case is never overwritten.
 
@@ -80,7 +80,7 @@ Expected format in subagent response:
 
 ### cleanup
 
-Removes skills **installed by skills-manager** (tracked in the registry) that were marked `useful: false` or never evaluated. Skills not installed by skills-manager are never touched. Failed removals are reported in a separate `failed` list and stay in the registry for the next run.
+Removes unused or unevaluated skills when the installed directory still matches its recorded identity and hash. Modified or replaced directories and older installations without this information stay on disk and appear in `preserved`. Removal errors appear in `failed`.
 
 ```bash
 skills-manager cleanup
@@ -99,7 +99,7 @@ skills-manager list
 
 ## Registry
 
-Skills usage history is stored in `.claude/skills-registry.json` in your project root:
+Skills usage history is stored in `.claude/skills-registry.json` in your project root. Install, evaluate and cleanup serialize their changes across local sessions. New installations also record `contentHash` and `directoryId` for cleanup. Example of an older entry:
 
 ```json
 {
@@ -123,7 +123,7 @@ Skills usage history is stored in `.claude/skills-registry.json` in your project
 No orchestrator needed — the agent itself picks and evaluates skills:
 
 1. `skills-manager search "<keyword>"` — pick the candidate that fits **your task** from `fromWeb`, not blindly the first. A `useful: true` entry in `fromRegistry` is already installed.
-2. `skills-manager install <repo> <skill>` — if quarantine flags come back, show them to the user; `--force` only after they confirm.
+2. `skills-manager install <repo> <skill>` — if the download is quarantined, show the flags and `contentHash` to the user. Pass `--force <sha256>` only with the hash they approved.
 3. Use the skill. If it doesn't show up among the session's available skills, read `.claude/skills/<skill>/SKILL.md` directly.
 4. When done, write your own `### Skills Report` to a file and run `skills-manager evaluate <file> <session-id>`.
 5. `skills-manager cleanup` at the end of the session.
@@ -139,7 +139,7 @@ let installed = 0
 for (const keyword of keywords) {
   if (installed >= 2) break  // max 2 external skills per orchestration
 
-  const output = execFileSync("skills-manager", ["search", keyword]).toString()
+  const output = execFileSync("skills-manager", ["search", keyword], { encoding: "utf8" })
   const json = JSON.parse(output.split("---JSON---")[1])
 
   // Already have a useful skill in registry — skip
@@ -148,8 +148,9 @@ for (const keyword of keywords) {
   // Let the orchestrator's LLM pick the candidate that fits the task — not blindly [0]
   if (json.fromWeb.length > 0) {
     const top = pickForTask(json.fromWeb, taskDescription)
-    execFileSync("skills-manager", ["install", top.repo, top.skill])
-    installed++
+    const result = JSON.parse(execFileSync("skills-manager", ["install", top.repo, top.skill], { encoding: "utf8" }))
+    if (result.installed) installed++
+    else console.warn(result.reason, result.contentHash ?? "")
   }
 }
 ```
@@ -174,10 +175,14 @@ At the end of your response, add:
 ### Step 1.5 — Evaluate Skills Report after subagent response
 
 ```js
-const tmpFile = `${workspaceDir}/tmp-response.txt`
-writeFileSync(tmpFile, workerResponse)
-execFileSync("skills-manager", ["evaluate", tmpFile, orchestrationId])
-unlinkSync(tmpFile)
+const reportDir = mkdtempSync(join(tmpdir(), "skills-report-"))
+try {
+  const reportFile = join(reportDir, "response.txt")
+  writeFileSync(reportFile, workerResponse)
+  execFileSync("skills-manager", ["evaluate", reportFile, orchestrationId])
+} finally {
+  rmSync(reportDir, { recursive: true, force: true })
+}
 ```
 
 ### Phase 4.5 — Cleanup after all tasks complete
@@ -202,7 +207,7 @@ Scanned patterns include:
 | Secret access | `process.env.*SECRET`, `process.env.*TOKEN`, `process.env.*KEY` |
 | Exfiltration | `send it to the API`, reads `.env.local` |
 
-Regex heuristics are a first line of defense, not a guarantee — that is why flagged skills are quarantined for human review (`--force` to override) instead of being silently trusted.
+Regex heuristics are a first line of defense, not a guarantee — that is why flagged skills are quarantined for human review (`--force <sha256>` after approval) instead of being silently trusted.
 
 ## License
 

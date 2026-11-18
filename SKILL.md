@@ -35,14 +35,14 @@ skills-manager search "security"
 ### install — установка с проверкой безопасности
 ```bash
 skills-manager install bobmatnyc/claude-mpm-skills vitest
-skills-manager install bobmatnyc/claude-mpm-skills vitest --force
+skills-manager install bobmatnyc/claude-mpm-skills vitest --force "$approved_hash"  # contentHash, подтверждённый пользователем
 ```
 
 Четыре уровня безопасности:
 1. Валидация входов — repo и имя скилла проверяются регэкспом до запуска любого процесса
 2. Trusted owners (anthropics, vercel-labs, github, ...) — устанавливается без сканирования
 3. Sandbox-сканирование — скилл скачивается один раз во временную папку, сканируются все файлы (SKILL.md, scripts/, синтаксис `` !`cmd` ``, hooks); в `.claude/skills` переносится именно проверенная копия. Каталог называется по имени из frontmatter скилла (в нижнем регистре) — реальное имя возвращается в `skillName`
-4. Карантин — скилл с флагами НЕ устанавливается, флаги возвращаются оркестратору; `--force` ставит после подтверждения человеком
+4. При карантине покажи пользователю флаги и SHA-256 из поля `contentHash`. После подтверждения передай именно этот хеш в `--force <sha256>`. Если содержимое изменилось, потребуется новый просмотр. Для установки нужен обычный файл `SKILL.md` и дерево без символических ссылок.
 
 ### evaluate — обработка Skills Report субагента
 ```bash
@@ -57,7 +57,7 @@ skills-manager evaluate /path/to/response.txt orch-2026-03-28
 skills-manager cleanup
 ```
 
-Удаляет скиллы с `useful: false` или `useful: null` — только те, что установлены через skills-manager (по реестру). Скиллы вне реестра никогда не удаляются. Упавшие удаления попадают в `failed` и остаются в реестре.
+Удаляет неиспользованные скиллы, если каталог и хеш совпадают с записью установки. Изменённые или заменённые каталоги и старые установки без контрольных данных остаются на диске и попадают в `preserved`. Ошибки удаления попадают в `failed`.
 
 ### list — показать реестр
 ```bash
@@ -69,16 +69,18 @@ skills-manager list
 Оркестратор не нужен: агент сам выбирает и оценивает скиллы.
 
 1. `skills-manager search "<ключевое слово задачи>"` — из `fromWeb` выбери кандидата, подходящего **твоей задаче** (по `name` и `repo`), а не первый в списке. Если в `fromRegistry` есть `useful: true` — он уже установлен, используй его.
-2. `skills-manager install <repo> <skill>` — если вернулись флаги карантина, покажи их пользователю; `--force` только после его подтверждения.
+2. `skills-manager install <repo> <skill>` — при карантине покажи флаги и `contentHash`. Передавай `--force <sha256>` только с подтверждённым пользователем хешем.
 3. Используй скилл. Если он не появился в списке доступных скиллов сессии, прочитай `.claude/skills/<skill>/SKILL.md` напрямую.
 4. После работы запиши свой отчёт в файл и передай его в evaluate:
    ```bash
-   cat > /tmp/skills-report.txt <<'EOF'
+   report_file=$(mktemp)
+   cat > "$report_file" <<'EOF'
    ### Skills Report
    - used: vitest
    - ignored: owasp-security (не понадобился)
    EOF
-   skills-manager evaluate /tmp/skills-report.txt session-2026-11-18
+   skills-manager evaluate "$report_file" session-2026-11-18
+   rm "$report_file"
    ```
 5. `skills-manager cleanup` — в конце сессии, если неиспользованные скиллы больше не нужны.
 
@@ -94,7 +96,7 @@ let externalSkillsInstalled = 0
 for (const keyword of keywords) {
   if (externalSkillsInstalled >= 2) break  // макс 2 внешних скилла
 
-  const output = execFileSync("skills-manager", ["search", keyword])
+  const output = execFileSync("skills-manager", ["search", keyword], { encoding: "utf8" })
   const json = JSON.parse(output.split("---JSON---")[1])
 
   // Есть useful:true в реестре → ставим
@@ -107,8 +109,9 @@ for (const keyword of keywords) {
   // Есть на skills.sh → LLM оркестратора выбирает кандидата под задачу, не слепо [0]
   if (json.fromWeb.length > 0) {
     const top = pickForTask(json.fromWeb, taskDescription)
-    execFileSync("skills-manager", ["install", top.repo, top.skill])
-    externalSkillsInstalled++
+    const result = JSON.parse(execFileSync("skills-manager", ["install", top.repo, top.skill], { encoding: "utf8" }))
+    if (result.installed) externalSkillsInstalled++
+    else console.warn(result.reason, result.contentHash ?? "")
   }
 }
 ```
@@ -133,10 +136,14 @@ for (const keyword of keywords) {
 ### Step 1.5: Evaluate Skills Report
 
 ```javascript
-const tmpFile = `${workspaceDir}/tmp-response.txt`
-writeFileSync(tmpFile, workerResponse)
-execFileSync("skills-manager", ["evaluate", tmpFile, orchestrationId])
-rmSync(tmpFile)
+const reportDir = mkdtempSync(join(tmpdir(), "skills-report-"))
+try {
+  const reportFile = join(reportDir, "response.txt")
+  writeFileSync(reportFile, workerResponse)
+  execFileSync("skills-manager", ["evaluate", reportFile, orchestrationId])
+} finally {
+  rmSync(reportDir, { recursive: true, force: true })
+}
 ```
 
 ### Phase 4.5: Cleanup
@@ -147,7 +154,7 @@ const result = execFileSync("skills-manager", ["cleanup"])
 
 ## Реестр
 
-`.claude/skills-registry.json` — отслеживает историю использования скиллов:
+Менеджер записывает историю в `.claude/skills-registry.json` и синхронизирует запись между локальными сессиями. У новых установок есть также `contentHash` и `directoryId` для проверки перед удалением. Пример старой записи:
 
 ```json
 {
