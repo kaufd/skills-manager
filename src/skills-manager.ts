@@ -84,9 +84,8 @@ export async function searchSkillsSh(query: string): Promise<SkillCandidate[]> {
     const resp = await fetch(url);
     if (!resp.ok) return [];
     const data = await resp.json() as { skills: { name: string; source: string; installs: number }[] };
-    return (data.skills ?? [])
-      .map((s) => ({ skill: s.name, repo: s.source, installs: s.installs }))
-      .sort((a, b) => b.installs - a.installs);
+    // Keep skills.sh order: it ranks by relevance (Algolia), re-sorting by installs loses that
+    return (data.skills ?? []).map((s) => ({ skill: s.name, repo: s.source, installs: s.installs }));
   } catch {
     return [];
   }

@@ -1,6 +1,6 @@
 ---
 name: skills-manager
-description: Dynamic skill discovery, install, evaluate and cleanup from skills.sh. Use in AI orchestrators to automatically find and install relevant skills per task, collect Skills Reports from subagents, and clean up unused skills after orchestration.
+description: Dynamic skill discovery, install, evaluate and cleanup from skills.sh. Use in AI orchestrators or in a single agent session to find and install relevant skills per task, collect Skills Reports, and clean up unused skills afterwards.
 metadata:
   version: "1.0.0"
   tags: ["orchestration", "skills", "agents", "claude"]
@@ -30,7 +30,7 @@ skills-manager search "security"
 ```
 
 Сначала ищет в локальном реестре `.claude/skills-registry.json`, затем на skills.sh.
-Возвращает JSON после разделителя `---JSON---`.
+Возвращает JSON после разделителя `---JSON---`. `fromWeb` идёт в порядке релевантности skills.sh, а не по числу установок. Первый результат не обязательно подходит задаче: выбирай по `name` и `repo`.
 
 ### install — установка с проверкой безопасности
 ```bash
@@ -63,6 +63,24 @@ skills-manager cleanup
 skills-manager list
 ```
 
+## Один агент в одной сессии
+
+Оркестратор не нужен: агент сам выбирает и оценивает скиллы.
+
+1. `skills-manager search "<ключевое слово задачи>"` — из `fromWeb` выбери кандидата, подходящего **твоей задаче** (по `name` и `repo`), а не первый в списке. Если в `fromRegistry` есть `useful: true` — он уже установлен, используй его.
+2. `skills-manager install <repo> <skill>` — если вернулись флаги карантина, покажи их пользователю; `--force` только после его подтверждения.
+3. Используй скилл. Если он не появился в списке доступных скиллов сессии, прочитай `.claude/skills/<skill>/SKILL.md` напрямую.
+4. После работы запиши свой отчёт в файл и передай его в evaluate:
+   ```bash
+   cat > /tmp/skills-report.txt <<'EOF'
+   ### Skills Report
+   - used: vitest
+   - ignored: owasp-security (не понадобился)
+   EOF
+   skills-manager evaluate /tmp/skills-report.txt session-2026-11-18
+   ```
+5. `skills-manager cleanup` — в конце сессии, если неиспользованные скиллы больше не нужны.
+
 ## Интеграция с оркестратором
 
 ### Phase 1.5: Skills Discovery (после планирования)
@@ -85,9 +103,9 @@ for (const keyword of keywords) {
     continue
   }
 
-  // Есть на skills.sh → ставим топ-1
+  // Есть на skills.sh → LLM оркестратора выбирает кандидата под задачу, не слепо [0]
   if (json.fromWeb.length > 0) {
-    const top = json.fromWeb[0]
+    const top = pickForTask(json.fromWeb, taskDescription)
     execSync(`skills-manager install "${top.repo}" "${top.skill}"`)
     externalSkillsInstalled++
   }

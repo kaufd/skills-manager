@@ -134,7 +134,7 @@ describe("skills-manager: searchSkillsSh", () => {
     }
   });
 
-  it("parses skills.sh response into candidates", async () => {
+  it("parses skills.sh response into candidates, keeping the API relevance order", async () => {
     const { searchSkillsSh } = await import("../src/skills-manager");
     const origFetch = globalThis.fetch;
     globalThis.fetch = () =>
@@ -142,8 +142,8 @@ describe("skills-manager: searchSkillsSh", () => {
         new Response(
           JSON.stringify({
             skills: [
-              { name: "vitest", source: "bobmatnyc/claude-mpm-skills", installs: 120 },
-              { name: "owasp", source: "hoodini/ai-agents-skills", installs: 45 },
+              { name: "vitest", source: "bobmatnyc/claude-mpm-skills", installs: 45 },
+              { name: "owasp", source: "hoodini/ai-agents-skills", installs: 120 },
             ],
           }),
           { status: 200 },
@@ -151,12 +151,10 @@ describe("skills-manager: searchSkillsSh", () => {
       );
     try {
       const results = await searchSkillsSh("testing");
-      expect(results).toHaveLength(2);
-      expect(results[0].skill).toBe("vitest");
-      expect(results[0].repo).toBe("bobmatnyc/claude-mpm-skills");
-      expect(results[0].installs).toBe(120);
-      expect(results[1].skill).toBe("owasp");
-      expect(results[1].installs).toBe(45);
+      expect(results).toEqual([
+        { skill: "vitest", repo: "bobmatnyc/claude-mpm-skills", installs: 45 },
+        { skill: "owasp", repo: "hoodini/ai-agents-skills", installs: 120 },
+      ]);
     } finally {
       globalThis.fetch = origFetch;
     }

@@ -40,6 +40,8 @@ skills-manager search security
 
 Output includes a `---JSON---` separator followed by machine-readable JSON — useful for orchestrators that need to parse results.
 
+`fromWeb` keeps skills.sh's relevance order (not sorted by installs). The first result is not necessarily right for the task — the calling agent should pick by `name`/`repo`.
+
 ### install
 
 Installs exactly one skill from a GitHub repo. Security pipeline:
@@ -114,6 +116,16 @@ Skills usage history is stored in `.claude/skills-registry.json` in your project
 }
 ```
 
+## Single Agent Session
+
+No orchestrator needed — the agent itself picks and evaluates skills:
+
+1. `skills-manager search "<keyword>"` — pick the candidate that fits **your task** from `fromWeb`, not blindly the first. A `useful: true` entry in `fromRegistry` is already installed.
+2. `skills-manager install <repo> <skill>` — if quarantine flags come back, show them to the user; `--force` only after they confirm.
+3. Use the skill. If it doesn't show up among the session's available skills, read `.claude/skills/<skill>/SKILL.md` directly.
+4. When done, write your own `### Skills Report` to a file and run `skills-manager evaluate <file> <session-id>`.
+5. `skills-manager cleanup` at the end of the session.
+
 ## Orchestrator Integration
 
 ### Phase 1.5 — Skills Discovery (after planning, before task loop)
@@ -131,9 +143,9 @@ for (const keyword of keywords) {
   // Already have a useful skill in registry — skip
   if (json.fromRegistry.some(s => s.useful === true)) continue
 
-  // Top result from skills.sh — install it
+  // Let the orchestrator's LLM pick the candidate that fits the task — not blindly [0]
   if (json.fromWeb.length > 0) {
-    const top = json.fromWeb[0]
+    const top = pickForTask(json.fromWeb, taskDescription)
     execSync(`skills-manager install "${top.repo}" "${top.skill}"`)
     installed++
   }

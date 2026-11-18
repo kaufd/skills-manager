@@ -37,7 +37,7 @@ async function searchSkillsSh(query) {
     const resp = await fetch(url);
     if (!resp.ok) return [];
     const data = await resp.json();
-    return (data.skills ?? []).map((s) => ({ skill: s.name, repo: s.source, installs: s.installs })).sort((a, b) => b.installs - a.installs);
+    return (data.skills ?? []).map((s) => ({ skill: s.name, repo: s.source, installs: s.installs }));
   } catch {
     return [];
   }
