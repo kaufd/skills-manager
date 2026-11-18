@@ -42,23 +42,37 @@ interface ScanResult {
     flags: string[];
 }
 declare function scanSkillContent(content: string): ScanResult;
-declare const SKILLS_CLI_VERSION = "1.4.6";
-declare function buildInstallCommand(repo: string, opts?: {
-    copy?: boolean;
-}): string;
-declare function getProjectSkillNames(skillsDir?: string): string[];
-declare function shouldSkipInstall(skillName: string, projectSkills: string[]): boolean;
-interface SafetyResult {
-    action: "allow" | "quarantine";
-    flags: string[];
-}
-declare function evaluateInstallSafety(repo: string, skillContent: string): SafetyResult;
+declare function scanSkillFile(path: string): Promise<ScanResult>;
+/** Scans every file of an installed skill tree (SKILL.md, scripts/, ...). Fails closed. */
+declare function scanSkillDir(skillDir: string): Promise<ScanResult>;
+declare const SKILLS_CLI_VERSION = "1.5.20";
+declare function validateRepo(repo: string): boolean;
+declare function validateSkillName(name: string): boolean;
+/** Runs the skills CLI without a shell — each arg is a separate argv entry, nothing is interpolated. */
+declare function npx(args: string[], opts: {
+    cwd: string;
+    timeout?: number;
+}): void;
+/** Args for installing exactly one skill as a copy via the claude-code agent (target dir is the CLI's cwd). */
+declare function buildInstallArgs(repo: string, skillName: string): string[];
+declare function buildRemoveArgs(skillName: string): string[];
+/** Names of skills physically present in the local skills dir (project-owned or installed). */
+declare function getLocalSkillNames(skillsDir?: string): string[];
+declare function shouldSkipInstall(skillName: string, localSkills: string[]): boolean;
 interface InstallResult {
     installed: boolean;
     skillName: string;
     reason: string;
+    flags: string[];
 }
-declare function install(repo: string, skillName: string, registryPath?: string): Promise<InstallResult>;
+/**
+ * Installs exactly one skill. Untrusted repos are installed into a throwaway
+ * sandbox dir first and every file is scanned; flagged skills are quarantined
+ * (not installed) unless opts.force is set after human review.
+ */
+declare function install(repo: string, skillName: string, registryPath?: string, opts?: {
+    force?: boolean;
+}): Promise<InstallResult>;
 interface SkillsReport {
     used: string[];
     ignored: string[];
@@ -68,9 +82,15 @@ declare function parseSkillsReport(subagentResponse: string): SkillsReport;
 declare function evaluateSkills(registry: SkillsRegistry, report: SkillsReport & {
     orchestrationId: string;
 }): SkillsRegistry;
-declare function getSkillsToRemove(registry: SkillsRegistry, projectSkills: string[]): string[];
+/**
+ * Candidates for removal: registry entries (skills installed by this tool)
+ * that were never marked useful, minus explicitly protected names.
+ * Skills on disk that are not in the registry are project-owned and never touched.
+ */
+declare function getSkillsToRemove(registry: SkillsRegistry, protectedNames: string[]): string[];
 declare function cleanup(registryPath?: string): Promise<{
     removed: string[];
+    failed: string[];
     kept: string[];
 }>;
 declare function parseArgs(argv: string[]): {
@@ -78,4 +98,4 @@ declare function parseArgs(argv: string[]): {
     args: string[];
 };
 
-export { DEFAULT_REGISTRY, type InstallResult, REGISTRY_PATH_DEFAULT, SKILLS_CLI_VERSION, SKILLS_DIR, type SafetyResult, type ScanResult, type SkillCandidate, type SkillEntry, type SkillsRegistry, type SkillsReport, TRUSTED_OWNERS, buildInstallCommand, cleanup, evaluateInstallSafety, evaluateSkills, getProjectSkillNames, getSkillsToRemove, install, isTrustedOwner, loadRegistry, parseArgs, parseSkillsReport, saveRegistry, scanSkillContent, search, searchRegistry, searchSkillsSh, shouldSkipInstall };
+export { DEFAULT_REGISTRY, type InstallResult, REGISTRY_PATH_DEFAULT, SKILLS_CLI_VERSION, SKILLS_DIR, type ScanResult, type SkillCandidate, type SkillEntry, type SkillsRegistry, type SkillsReport, TRUSTED_OWNERS, buildInstallArgs, buildRemoveArgs, cleanup, evaluateSkills, getLocalSkillNames, getSkillsToRemove, install, isTrustedOwner, loadRegistry, npx, parseArgs, parseSkillsReport, saveRegistry, scanSkillContent, scanSkillDir, scanSkillFile, search, searchRegistry, searchSkillsSh, shouldSkipInstall, validateRepo, validateSkillName };

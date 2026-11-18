@@ -35,12 +35,14 @@ skills-manager search "security"
 ### install — установка с проверкой безопасности
 ```bash
 skills-manager install bobmatnyc/claude-mpm-skills vitest
+skills-manager install bobmatnyc/claude-mpm-skills vitest --force
 ```
 
-Три уровня безопасности:
-1. Trusted owners (anthropics, vercel-labs, github, ...) — устанавливается без сканирования
-2. Сканирование SKILL.md на опасные паттерны (prompt injection, shell pipes, secret access)
-3. Карантин — удаляет скилл если найдены флаги
+Четыре уровня безопасности:
+1. Валидация входов — repo и имя скилла проверяются регэкспом до запуска любого процесса
+2. Trusted owners (anthropics, vercel-labs, github, ...) — устанавливается без сканирования
+3. Sandbox-сканирование — скилл ставится во временную папку, сканируются все файлы (SKILL.md, scripts/, синтаксис `` !`cmd` ``, hooks)
+4. Карантин — скилл с флагами НЕ устанавливается, флаги возвращаются оркестратору; `--force` ставит после подтверждения человеком
 
 ### evaluate — обработка Skills Report субагента
 ```bash
@@ -54,7 +56,7 @@ skills-manager evaluate /path/to/response.txt orch-2026-03-28
 skills-manager cleanup
 ```
 
-Удаляет скиллы с `useful: false` или `useful: null`. Проектные скиллы (`.claude/skills/`) никогда не удаляются.
+Удаляет скиллы с `useful: false` или `useful: null` — только те, что установлены через skills-manager (по реестру). Скиллы вне реестра никогда не удаляются. Упавшие удаления попадают в `failed` и остаются в реестре.
 
 ### list — показать реестр
 ```bash

@@ -21,7 +21,8 @@ skills-manager <command> [args]
 
 Commands:
   search <query>                    Search skills (local registry → skills.sh)
-  install <owner/repo> <name>       Install a skill with security scanning
+  install <owner/repo> <name> [--force]
+                                    Install a skill with security scanning
   evaluate <response-file> <id>     Parse Skills Report from subagent response
   cleanup                           Remove unused skills
   list                              Show local registry
@@ -41,17 +42,21 @@ Output includes a `---JSON---` separator followed by machine-readable JSON — u
 
 ### install
 
-Installs a skill from a GitHub repo with a three-tier security check:
+Installs exactly one skill from a GitHub repo. Security pipeline:
 
-1. **Trusted owners** (anthropics, vercel-labs, github, firebase, trailofbits) — installed without scanning
-2. **Content scan** — checks SKILL.md for prompt injection, dangerous shell commands, secret access patterns
-3. **Quarantine** — removes the skill and reports if flags are found
+1. **Input validation** — repo and skill names are checked (`^[\w.-]+/[\w.-]+$`, `^[\w][\w.-]*$`) before any subprocess runs
+2. **Trusted owners** (anthropics, vercel-labs, github, firebase, trailofbits) — installed without scanning
+3. **Sandbox scan** (everyone else) — the skill is installed into a temporary sandbox dir first and *every* file is scanned (SKILL.md, `scripts/`, load-time hooks, ...)
+4. **Quarantine** — flagged skills are **not installed**; the flags are returned so a human can review. `--force` installs anyway after review
 
 ```bash
 skills-manager install bobmatnyc/claude-mpm-skills vitest
+skills-manager install bobmatnyc/claude-mpm-skills vitest --force   # after human review
 ```
 
-Returns JSON: `{ installed, skillName, reason }`.
+Returns JSON: `{ installed, skillName, reason, flags }`.
+
+Note: the skills CLI also writes its own `skills-lock.json` to your project root — that's the CLI's install manifest, not skills-manager's registry.
 
 ### evaluate
 
@@ -71,7 +76,7 @@ Expected format in subagent response:
 
 ### cleanup
 
-Removes skills marked as `useful: false` or never evaluated (`useful: null`). Project skills in `.claude/skills/` are never removed.
+Removes skills **installed by skills-manager** (tracked in the registry) that were marked `useful: false` or never evaluated. Skills not installed by skills-manager are never touched. Failed removals are reported in a separate `failed` list and stay in the registry for the next run.
 
 ```bash
 skills-manager cleanup
@@ -169,14 +174,20 @@ execSync("skills-manager cleanup")
 
 ## Security
 
+- All `skills` CLI invocations use `execFileSync` with argument arrays — repo and skill names are never interpolated into a shell string, and are additionally validated with a regexp before any subprocess runs.
+- Untrusted skills are installed into a sandbox dir first; every file of the skill (not just SKILL.md) is scanned before anything lands in the project.
+
 Scanned patterns include:
 
 | Category | Examples |
 |----------|----------|
 | Prompt injection | `ignore previous instructions`, `you are now`, `do not follow` |
-| Dangerous shell | `curl ... \| sh`, `wget ... \| bash`, `rm -rf /` |
+| Dangerous shell | `curl ... \| sh`, `wget ... \| bash`, `rm -rf /`, `base64 -d ... \| sh` |
+| Load-time hooks | `` !`command` `` executed on skill load, `hooks:` frontmatter |
 | Secret access | `process.env.*SECRET`, `process.env.*TOKEN`, `process.env.*KEY` |
 | Exfiltration | `send it to the API`, reads `.env.local` |
+
+Regex heuristics are a first line of defense, not a guarantee — that is why flagged skills are quarantined for human review (`--force` to override) instead of being silently trusted.
 
 ## License
 

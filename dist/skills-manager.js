@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 
 // src/skills-manager.ts
-import { readFile, writeFile } from "fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "fs/promises";
 import { existsSync, readdirSync } from "fs";
-import { execSync } from "child_process";
-import { join } from "path";
+import { execFileSync } from "child_process";
+import { basename, join } from "path";
+import { tmpdir } from "os";
 var TRUSTED_OWNERS = ["anthropics", "vercel-labs", "firebase", "trailofbits", "github"];
 var DEFAULT_REGISTRY = {
   skills: {},
@@ -75,6 +76,18 @@ var DANGEROUS_PATTERNS = [
   {
     pattern: /(read|cat|source|parse|load)\s+.*\.env\.local/i,
     description: "suspicious: reads .env.local"
+  },
+  {
+    pattern: /^\s*!`[^\n]+`/m,
+    description: "dangerous: shell command executed on skill load"
+  },
+  {
+    pattern: /^---\n[\s\S]*?^hooks:/m,
+    description: "dangerous: skill declares hooks"
+  },
+  {
+    pattern: /base64\s+(-d|--decode)[^|]*\|/i,
+    description: "dangerous: base64-decoded pipe to shell"
   }
 ];
 function scanSkillContent(content) {
@@ -86,72 +99,132 @@ function scanSkillContent(content) {
   }
   return { safe: flags.length === 0, flags };
 }
-var SKILLS_CLI_VERSION = "1.4.6";
-function buildInstallCommand(repo, opts = {}) {
-  const parts = [`npx skills@${SKILLS_CLI_VERSION} add ${repo}`];
-  if (opts.copy) parts.push("--copy");
-  parts.push("-y");
-  return parts.join(" ");
+var MAX_SCAN_FILE_BYTES = 512 * 1024;
+async function scanSkillFile(path) {
+  let content;
+  try {
+    const info = await stat(path);
+    if (info.size > MAX_SCAN_FILE_BYTES) {
+      return { safe: false, flags: [`file too large to scan: ${basename(path)}`] };
+    }
+    content = await readFile(path);
+  } catch {
+    return { safe: false, flags: [`unreadable file: ${basename(path)}`] };
+  }
+  if (content.includes(0)) {
+    return { safe: false, flags: [`binary file in skill: ${basename(path)}`] };
+  }
+  return scanSkillContent(content.toString("utf-8"));
 }
-function getProjectSkillNames(skillsDir = SKILLS_DIR) {
+async function scanSkillDir(skillDir) {
+  let entries;
+  try {
+    entries = await readdir(skillDir, { withFileTypes: true });
+  } catch {
+    return { safe: false, flags: ["skill directory not found or unreadable"] };
+  }
+  const flags = [];
+  for (const entry of entries) {
+    const full = join(skillDir, entry.name);
+    if (entry.isDirectory()) {
+      flags.push(...(await scanSkillDir(full)).flags);
+    } else if (entry.isFile()) {
+      flags.push(...(await scanSkillFile(full)).flags);
+    } else {
+      flags.push(`suspicious: non-regular file in skill directory: ${entry.name}`);
+    }
+  }
+  const unique = [...new Set(flags)];
+  return { safe: unique.length === 0, flags: unique };
+}
+var SKILLS_CLI_VERSION = "1.5.20";
+var REPO_PATTERN = /^[\w.-]+\/[\w.-]+$/;
+var SKILL_NAME_PATTERN = /^[\w][\w.-]*$/;
+function validateRepo(repo) {
+  return REPO_PATTERN.test(repo);
+}
+function validateSkillName(name) {
+  return SKILL_NAME_PATTERN.test(name);
+}
+function npxFile() {
+  return process.platform === "win32" ? "npx.cmd" : "npx";
+}
+function npx(args, opts) {
+  execFileSync(npxFile(), args, { stdio: "pipe", cwd: opts.cwd, timeout: opts.timeout ?? 3e4 });
+}
+function buildInstallArgs(repo, skillName) {
+  return [
+    `skills@${SKILLS_CLI_VERSION}`,
+    "add",
+    repo,
+    "--skill",
+    skillName,
+    "--copy",
+    "-a",
+    "claude-code",
+    "-y"
+  ];
+}
+function buildRemoveArgs(skillName) {
+  return [`skills@${SKILLS_CLI_VERSION}`, "remove", "-s", skillName, "-y"];
+}
+function getLocalSkillNames(skillsDir = SKILLS_DIR) {
   try {
     return readdirSync(skillsDir).filter((name) => !name.startsWith("."));
   } catch {
     return [];
   }
 }
-function shouldSkipInstall(skillName, projectSkills) {
-  return projectSkills.includes(skillName);
+function shouldSkipInstall(skillName, localSkills) {
+  return localSkills.includes(skillName);
 }
-function evaluateInstallSafety(repo, skillContent) {
-  if (isTrustedOwner(repo)) {
-    return { action: "allow", flags: [] };
+async function install(repo, skillName, registryPath = REGISTRY_PATH_DEFAULT, opts = {}) {
+  if (!validateRepo(repo)) {
+    return { installed: false, skillName, reason: "invalid repo", flags: [] };
   }
-  const scan = scanSkillContent(skillContent);
-  if (!scan.safe) {
-    return { action: "quarantine", flags: scan.flags };
+  if (!validateSkillName(skillName)) {
+    return { installed: false, skillName, reason: "invalid skill name", flags: [] };
   }
-  return { action: "allow", flags: [] };
-}
-async function install(repo, skillName, registryPath = REGISTRY_PATH_DEFAULT) {
-  const projectSkills = getProjectSkillNames();
-  if (shouldSkipInstall(skillName, projectSkills)) {
+  if (shouldSkipInstall(skillName, getLocalSkillNames())) {
     return {
       installed: false,
       skillName,
-      reason: `conflict: project skill "${skillName}" already exists`
+      reason: `conflict: local skill "${skillName}" already exists`,
+      flags: []
     };
   }
-  const cmd = buildInstallCommand(repo, { copy: true });
-  try {
-    execSync(cmd, { stdio: "pipe", timeout: 3e4 });
-  } catch (err) {
-    return {
-      installed: false,
-      skillName,
-      reason: `install failed: ${String(err)}`
-    };
-  }
-  const skillMdPath = join(SKILLS_DIR, skillName, "SKILL.md");
-  let content;
-  try {
-    content = await readFile(skillMdPath, "utf-8");
-  } catch {
-    return { installed: true, skillName, reason: "installed, SKILL.md not found for scan" };
-  }
-  const safety = evaluateInstallSafety(repo, content);
-  if (safety.action === "quarantine") {
+  let forceFlags = [];
+  if (!isTrustedOwner(repo)) {
+    let flags;
     try {
-      execSync(`npx skills@${SKILLS_CLI_VERSION} remove -s ${skillName} -y`, {
-        stdio: "pipe",
-        timeout: 15e3
-      });
+      flags = await scanInSandbox(repo, skillName);
+    } catch (err) {
+      return { installed: false, skillName, reason: `sandbox install failed: ${String(err)}`, flags: [] };
+    }
+    if (flags.length > 0 && !opts.force) {
+      return { installed: false, skillName, reason: `quarantine: ${flags.join(", ")}`, flags };
+    }
+    forceFlags = flags;
+  }
+  try {
+    npx(buildInstallArgs(repo, skillName), { cwd: process.cwd(), timeout: 6e4 });
+  } catch (err) {
+    return { installed: false, skillName, reason: `install failed: ${String(err)}`, flags: [] };
+  }
+  try {
+    await readFile(join(SKILLS_DIR, skillName, "SKILL.md"), "utf-8");
+  } catch {
+    let rolledBack = false;
+    try {
+      npx(buildRemoveArgs(skillName), { cwd: process.cwd(), timeout: 15e3 });
+      rolledBack = true;
     } catch {
     }
     return {
       installed: false,
       skillName,
-      reason: `quarantine: ${safety.flags.join(", ")}`
+      reason: rolledBack ? "installed but SKILL.md not found; rolled back" : `installed but SKILL.md not found; rollback failed, remove .claude/skills/${skillName} manually`,
+      flags: []
     };
   }
   const registry = await loadRegistry(registryPath);
@@ -165,7 +238,18 @@ async function install(repo, skillName, registryPath = REGISTRY_PATH_DEFAULT) {
     trusted: isTrustedOwner(repo)
   };
   await saveRegistry(registryPath, registry);
-  return { installed: true, skillName, reason: "ok" };
+  const reason = forceFlags.length > 0 ? `force-installed despite flags: ${forceFlags.join(", ")}` : "ok";
+  return { installed: true, skillName, reason, flags: forceFlags };
+}
+async function scanInSandbox(repo, skillName) {
+  const sandbox = await mkdtemp(join(tmpdir(), "skills-manager-"));
+  try {
+    npx(buildInstallArgs(repo, skillName), { cwd: sandbox, timeout: 6e4 });
+    const scan = await scanSkillDir(join(sandbox, ".claude", "skills", skillName));
+    return scan.flags;
+  } finally {
+    await rm(sandbox, { recursive: true, force: true });
+  }
 }
 function parseSkillsReport(subagentResponse) {
   const reportMatch = subagentResponse.match(
@@ -202,34 +286,34 @@ function evaluateSkills(registry, report) {
   }
   return registry;
 }
-function getSkillsToRemove(registry, projectSkills) {
+function getSkillsToRemove(registry, protectedNames) {
   return Object.values(registry.skills).filter((s) => {
-    if (projectSkills.includes(s.skill)) return false;
+    if (protectedNames.includes(s.skill)) return false;
     return s.useful !== true;
   }).map((s) => s.skill);
 }
 async function cleanup(registryPath = REGISTRY_PATH_DEFAULT) {
   const registry = await loadRegistry(registryPath);
-  const projectSkills = getProjectSkillNames();
-  const toRemove = getSkillsToRemove(registry, projectSkills);
+  const toRemove = getSkillsToRemove(registry, []);
   const removed = [];
+  const failed = [];
   for (const name of toRemove) {
-    try {
-      execSync(`npx skills@${SKILLS_CLI_VERSION} remove -s ${name} -y`, {
-        stdio: "pipe",
-        timeout: 15e3
-      });
-      removed.push(name);
-    } catch {
-      removed.push(name);
-    }
-    if (registry.skills[name]?.useful === false) {
+    if (!validateSkillName(name)) {
+      failed.push(name);
       delete registry.skills[name];
+      continue;
+    }
+    try {
+      npx(buildRemoveArgs(name), { cwd: process.cwd(), timeout: 3e4 });
+      removed.push(name);
+      delete registry.skills[name];
+    } catch {
+      failed.push(name);
     }
   }
-  const kept = Object.keys(registry.skills).filter((name) => !toRemove.includes(name));
+  const kept = Object.keys(registry.skills);
   await saveRegistry(registryPath, registry);
-  return { removed, kept };
+  return { removed, failed, kept };
 }
 function parseArgs(argv) {
   const [command = "help", ...args] = argv;
@@ -245,7 +329,8 @@ Usage:
 
 Commands:
   search <query> [limit]            Search skills (local registry \u2192 skills.sh), default 10
-  install <owner/repo> <name>       Install a skill with security scanning
+  install <owner/repo> <name> [--force]
+                                    Install a skill with security scanning
   evaluate <response-file> <id>     Parse Skills Report from subagent response
   cleanup                           Remove unused skills
   list                              Show local registry
@@ -254,6 +339,7 @@ Commands:
 Examples:
   skills-manager search vitest
   skills-manager install bobmatnyc/claude-mpm-skills vitest
+  skills-manager install bobmatnyc/claude-mpm-skills vitest --force
   skills-manager evaluate /tmp/response.txt orch-2026-03-28
   skills-manager cleanup
   skills-manager list
@@ -264,8 +350,10 @@ Registry:
 
 Security:
   Trusted owners (anthropics, vercel-labs, github, ...) skip scanning.
-  Untrusted skills are scanned for prompt injection, dangerous shell
-  commands, and secret access patterns before install.
+  Untrusted skills are installed into a sandbox dir first and every file
+  is scanned (SKILL.md, scripts/, load-time hooks). Flagged skills are
+  quarantined: NOT installed, flags are returned. Pass --force after
+  human review to install anyway.
 `);
 }
 async function main() {
@@ -300,15 +388,15 @@ async function main() {
       break;
     }
     case "install": {
-      const repo = args[0];
-      const skillName = args[1];
+      const force = args.includes("--force");
+      const [repo, skillName] = args.filter((a) => a !== "--force");
       if (!repo || !skillName) {
         console.error(
-          "Error: repo and name required\nUsage: skills-manager install <owner/repo> <skill-name>"
+          "Error: repo and name required\nUsage: skills-manager install <owner/repo> <skill-name> [--force]"
         );
         process.exit(1);
       }
-      const result = await install(repo, skillName);
+      const result = await install(repo, skillName, REGISTRY_PATH_DEFAULT, { force });
       console.log(JSON.stringify(result));
       break;
     }
@@ -332,6 +420,9 @@ async function main() {
     case "cleanup": {
       const result = await cleanup();
       console.log(`Removed: ${result.removed.join(", ") || "none"}`);
+      if (result.failed.length > 0) {
+        console.log(`Failed:  ${result.failed.join(", ")}`);
+      }
       console.log(`Kept:    ${result.kept.join(", ") || "none"}`);
       console.log(JSON.stringify(result));
       break;
@@ -374,21 +465,26 @@ export {
   SKILLS_CLI_VERSION,
   SKILLS_DIR,
   TRUSTED_OWNERS,
-  buildInstallCommand,
+  buildInstallArgs,
+  buildRemoveArgs,
   cleanup,
-  evaluateInstallSafety,
   evaluateSkills,
-  getProjectSkillNames,
+  getLocalSkillNames,
   getSkillsToRemove,
   install,
   isTrustedOwner,
   loadRegistry,
+  npx,
   parseArgs,
   parseSkillsReport,
   saveRegistry,
   scanSkillContent,
+  scanSkillDir,
+  scanSkillFile,
   search,
   searchRegistry,
   searchSkillsSh,
-  shouldSkipInstall
+  shouldSkipInstall,
+  validateRepo,
+  validateSkillName
 };
